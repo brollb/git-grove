@@ -13,6 +13,8 @@ use crate::git::{self, Status};
 
 pub enum Msg {
     Status(PathBuf, Status),
+    /// A worktree removal finished, successfully or not.
+    Removed(PathBuf, Result<(), String>),
     /// The cheap age estimate for a worktree.
     Age(PathBuf, Option<u64>),
     /// PRs for the repo at this index, or the reason they are unavailable.
@@ -30,6 +32,8 @@ type Queue = Arc<(Mutex<Vec<(Kind, PathBuf)>>, Condvar)>;
 pub struct Loader {
     queue: Queue,
     requested: HashSet<(bool, PathBuf)>,
+    /// One removal channel per repo — see [`Loader::remove`].
+    removers: HashMap<PathBuf, Sender<(PathBuf, bool)>>,
     tx: Sender<Msg>,
 }
 
@@ -48,6 +52,7 @@ impl Loader {
             Loader {
                 queue,
                 requested: HashSet::new(),
+                removers: HashMap::new(),
                 tx,
             },
             rx,
@@ -77,6 +82,32 @@ impl Loader {
         lock.lock().unwrap().push((kind, path.to_path_buf()));
         cv.notify_one();
         true
+    }
+
+    /// Remove a worktree off the UI thread, reporting the result as a message.
+    ///
+    /// Each repo gets one removal thread, so removals within a repo run one at
+    /// a time and cannot race each other's administrative files (a `prune` for
+    /// one stale worktree could otherwise clear an entry another removal is
+    /// still working on), while separate repos proceed in parallel. Deleting a
+    /// worktree means an `rm -rf` of a whole checkout, so this can take a while
+    /// per worktree — hence not on the thread that draws the screen.
+    pub fn remove(&mut self, repo_main: &Path, path: PathBuf, force: bool) {
+        let tx = self.tx.clone();
+        let repo = repo_main.to_path_buf();
+        let sender = self.removers.entry(repo.clone()).or_insert_with(move || {
+            let (jobs_tx, jobs_rx) = channel::<(PathBuf, bool)>();
+            thread::spawn(move || {
+                for (path, force) in jobs_rx {
+                    let result = git::remove_worktree(&repo, &path, force);
+                    if tx.send(Msg::Removed(path, result)).is_err() {
+                        return; // receiver gone: we are shutting down
+                    }
+                }
+            });
+            jobs_tx
+        });
+        let _ = sender.send((path, force));
     }
 
     /// Drop the memos for `path` so it is recomputed on next request — used

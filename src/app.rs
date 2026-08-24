@@ -105,6 +105,9 @@ impl App {
             Msg::Prs(repo, result) => {
                 self.prs.insert(repo, result);
             }
+            // Removals are batched by the picker, which drops the rows itself
+            // once the whole batch has reported in.
+            Msg::Removed(..) => {}
         }
     }
 

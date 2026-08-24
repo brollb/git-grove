@@ -13,7 +13,7 @@ use crossterm::{execute, terminal};
 use crate::app::{App, PrCell, Sort};
 use crate::fuzzy::Hits;
 use crate::gh;
-use crate::git::{self, Status};
+use crate::git::Status;
 use crate::load::{Loader, Msg};
 
 const RESET: &str = "\x1b[0m";
@@ -117,6 +117,7 @@ pub fn run(
     let mut mode = Mode::Normal;
     let mut prompt: Option<Prompt> = None;
     let mut message: Option<String> = None;
+    let mut batch = Batch::default();
     let selected;
 
     loop {
@@ -142,6 +143,7 @@ pub fn run(
         }
 
         if dirty {
+            let progress = batch.progress();
             let frame = Frame {
                 rows: &rows,
                 query: &state.query,
@@ -151,6 +153,8 @@ pub fn run(
                 view,
                 width,
                 marked: &state.marked,
+                removing: &batch.pending,
+                progress: &progress,
                 prompt: prompt.as_ref(),
                 message: message.as_deref(),
             };
@@ -172,28 +176,60 @@ pub fn run(
                         break;
                     }
 
+                    // While worktrees are being deleted, keys that would leave
+                    // the picker are held back: quitting would kill the removals
+                    // mid-`rm`. ctrl-c above still gets out.
+                    if batch.in_flight()
+                        && matches!(
+                            key.code,
+                            KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('d') | KeyCode::Esc
+                        )
+                        && mode == Mode::Normal
+                    {
+                        message = Some("ctrl-c to quit anyway".to_string());
+                        dirty = true;
+                        continue;
+                    }
+
                     if let Some(pending) = prompt.take() {
                         // A confirmation is up: only its own answers count, and
                         // anything else dismisses it without acting.
                         match (&pending, key.code) {
                             (Prompt::Delete(targets), KeyCode::Char('y' | 'Y'))
                             | (Prompt::Force(targets), KeyCode::Char('f' | 'F')) => {
-                                let force = matches!(pending, Prompt::Force(_));
-                                let outcome = remove_all(app, targets, force);
-                                let removed: HashSet<PathBuf> =
-                                    outcome.removed.iter().cloned().collect();
-                                app.forget_worktrees(&removed);
-                                state.marked.retain(|p| !removed.contains(p));
-                                for path in &removed {
-                                    loader.forget(path);
+                                // Hand every removal to a background thread and
+                                // keep drawing: an `rm -rf` per worktree adds up
+                                // to minutes across a big batch.
+                                batch = Batch::starting(targets.len());
+                                batch.force = matches!(pending, Prompt::Force(_));
+                                for target in targets {
+                                    let Some(wt) = app.worktrees.iter().find(|w| &w.path == target)
+                                    else {
+                                        batch.total -= 1;
+                                        continue;
+                                    };
+                                    if let Some(reason) = cannot_remove(wt) {
+                                        // Never dispatched, so it is not part of
+                                        // the progress count, and forcing it
+                                        // would not help either.
+                                        batch.total -= 1;
+                                        batch.refused.push((target.clone(), reason));
+                                        continue;
+                                    }
+                                    batch.pending.insert(target.clone());
+                                    loader.remove(app.repo_main(wt), target.clone(), batch.force);
                                 }
-                                message = Some(outcome.summary());
-                                if !outcome.failed.is_empty() && !force {
-                                    prompt = Some(Prompt::Force(
-                                        outcome.failed.iter().map(|(p, _)| p.clone()).collect(),
-                                    ));
+                                if batch.pending.is_empty() {
+                                    finish_batch(
+                                        app,
+                                        loader,
+                                        state,
+                                        &mut batch,
+                                        &mut message,
+                                        &mut prompt,
+                                    );
+                                    requery = true;
                                 }
-                                requery = true;
                             }
                             _ => message = Some("  cancelled".to_string()),
                         }
@@ -343,16 +379,32 @@ pub fn run(
 
         let mut prs_arrived = false;
         let mut ages_arrived = false;
+        let mut removal_arrived = false;
         while let Ok(msg) = rx.try_recv() {
             prs_arrived |= matches!(msg, Msg::Prs(..));
             ages_arrived |= matches!(msg, Msg::Age(..) | Msg::Status(..));
-            app.apply(msg);
+            if let Msg::Removed(path, result) = msg {
+                batch.pending.remove(&path);
+                match result {
+                    Ok(()) => batch.removed.push(path),
+                    Err(reason) => batch.failed.push((path, reason)),
+                }
+                removal_arrived = true;
+            } else {
+                app.apply(msg);
+            }
             dirty = true;
+        }
+        // Rows are dropped once the whole batch has reported, so the list does
+        // not reshuffle under the cursor on every individual removal.
+        let batch_done = removal_arrived && !batch.in_flight();
+        if batch_done {
+            finish_batch(app, loader, state, &mut batch, &mut message, &mut prompt);
         }
         // PR numbers are searchable, so late-arriving PRs can change the match
         // set; newly dated rows can change a recency sort's order.
         let resort = ages_arrived && app.sort != Sort::Name;
-        if resort || (prs_arrived && !state.query.trim().is_empty()) {
+        if batch_done || resort || (prs_arrived && !state.query.trim().is_empty()) {
             let keep = match rows.get(sel) {
                 Some(Row::Item(i, _)) => Some(*i),
                 _ => None,
@@ -391,7 +443,78 @@ fn delete_targets(app: &App, marked: &HashSet<PathBuf>, rows: &[Row], sel: usize
     }
 }
 
+/// One round of deletions, in flight on the background threads.
 #[derive(Default)]
+struct Batch {
+    /// Removals dispatched and not yet reported back.
+    pending: HashSet<PathBuf>,
+    removed: Vec<PathBuf>,
+    /// git refused these; forcing may get past it.
+    failed: Vec<(PathBuf, String)>,
+    /// We refused these ourselves; forcing would not change the answer.
+    refused: Vec<(PathBuf, String)>,
+    /// How many were dispatched, for the progress line.
+    total: usize,
+    /// Whether this round was already the forced one.
+    force: bool,
+}
+
+impl Batch {
+    fn starting(total: usize) -> Batch {
+        Batch {
+            total,
+            ..Default::default()
+        }
+    }
+
+    fn in_flight(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    fn progress(&self) -> String {
+        format!(
+            "  removing {} of {}\u{2026}",
+            self.total - self.pending.len(),
+            self.total
+        )
+    }
+
+    fn outcome(&self) -> Removal {
+        let mut failed = self.failed.clone();
+        failed.extend(self.refused.iter().cloned());
+        Removal {
+            removed: self.removed.clone(),
+            failed,
+        }
+    }
+}
+
+/// Apply a finished batch: drop the rows that are gone, report, and offer to
+/// force whatever git refused.
+fn finish_batch(
+    app: &mut App,
+    loader: &mut Loader,
+    state: &mut PickerState,
+    batch: &mut Batch,
+    message: &mut Option<String>,
+    prompt: &mut Option<Prompt>,
+) {
+    let removed: HashSet<PathBuf> = batch.removed.iter().cloned().collect();
+    app.forget_worktrees(&removed);
+    state.marked.retain(|p| !removed.contains(p));
+    for path in &removed {
+        loader.forget(path);
+    }
+    *message = Some(batch.outcome().summary());
+    if !batch.failed.is_empty() && !batch.force {
+        *prompt = Some(Prompt::Force(
+            batch.failed.iter().map(|(p, _)| p.clone()).collect(),
+        ));
+    }
+    *batch = Batch::default();
+}
+
+#[derive(Default, Clone)]
 struct Removal {
     removed: Vec<PathBuf>,
     failed: Vec<(PathBuf, String)>,
@@ -417,25 +540,10 @@ impl Removal {
     }
 }
 
-fn remove_all(app: &App, targets: &[PathBuf], force: bool) -> Removal {
-    let mut outcome = Removal::default();
-    for target in targets {
-        let Some(wt) = app.worktrees.iter().find(|w| &w.path == target) else {
-            continue;
-        };
-        if wt.main {
-            outcome.failed.push((
-                target.clone(),
-                "a repo's main worktree cannot be removed".to_string(),
-            ));
-            continue;
-        }
-        match git::remove_worktree(app.repo_main(wt), target, force) {
-            Ok(()) => outcome.removed.push(target.clone()),
-            Err(reason) => outcome.failed.push((target.clone(), reason)),
-        }
-    }
-    outcome
+/// Why a worktree cannot be removed at all, decided before any git call.
+fn cannot_remove(wt: &crate::git::Worktree) -> Option<String> {
+    wt.main
+        .then(|| "a repo's main worktree cannot be removed".to_string())
 }
 
 fn build_rows(app: &App, query: &str) -> Vec<Row> {
@@ -554,6 +662,8 @@ struct Frame<'a> {
     view: usize,
     width: usize,
     marked: &'a HashSet<PathBuf>,
+    removing: &'a HashSet<PathBuf>,
+    progress: &'a str,
     prompt: Option<&'a Prompt>,
     message: Option<&'a str>,
 }
@@ -629,7 +739,11 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
                 let selected = idx == sel;
                 let pr_cell = fit(&pr_text(app.pr_for(wt)), w.pr);
                 let status = app.statuses.get(&wt.path);
-                let status_cell = fit(&status_text(status, wt.locked, wt.prunable), w.status);
+                let status_cell = if f.removing.contains(&wt.path) {
+                    fit("removing\u{2026}", w.status)
+                } else {
+                    fit(&status_text(status, wt.locked, wt.prunable), w.status)
+                };
                 let age_cell = fit_right(&age_text(status, now), w.age);
                 let branch = wt.branch_label();
                 let path = crate::app::display_path(&wt.path, Some(&app.root));
@@ -700,10 +814,20 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
         _ => String::new(),
     };
     line(&mut buf, &fit(&detail, width));
-    let footer = match (f.prompt, f.message) {
-        (Some(prompt), _) => paint(YELLOW, &fit(&prompt_text(prompt), width), color),
-        (None, Some(message)) => fit(message, width),
-        (None, None) => paint(DIM, &fit(hints(f.mode), width), color),
+    let footer = if !f.removing.is_empty() {
+        // Progress keeps ticking, but anything the picker needs to say (such as
+        // why `q` did nothing) rides along with it rather than replacing it.
+        let text = match f.message {
+            Some(message) => format!("{}  \u{b7} {}", f.progress.trim_end(), message.trim()),
+            None => f.progress.to_string(),
+        };
+        paint(YELLOW, &fit(&text, width), color)
+    } else {
+        match (f.prompt, f.message) {
+            (Some(prompt), _) => paint(YELLOW, &fit(&prompt_text(prompt), width), color),
+            (None, Some(message)) => fit(message, width),
+            (None, None) => paint(DIM, &fit(hints(f.mode), width), color),
+        }
     };
     line(&mut buf, &footer);
 
@@ -1190,6 +1314,7 @@ mod tests {
     }
 
     fn frame<'a>(query: &'a str, mode: Mode, marked: &'a HashSet<PathBuf>) -> Frame<'a> {
+        static NONE: std::sync::OnceLock<HashSet<PathBuf>> = std::sync::OnceLock::new();
         Frame {
             rows: &[],
             query,
@@ -1199,6 +1324,8 @@ mod tests {
             view: 10,
             width: 60,
             marked,
+            removing: NONE.get_or_init(HashSet::new),
+            progress: "",
             prompt: None,
             message: None,
         }
@@ -1300,12 +1427,61 @@ mod tests {
     }
 
     #[test]
-    fn the_main_worktree_is_never_removed() {
+    fn the_main_worktree_is_refused_before_git_is_asked() {
         let app = app_with(&["/r", "/r/a"]);
-        let outcome = remove_all(&app, &[PathBuf::from("/r")], true);
-        assert!(outcome.removed.is_empty());
-        assert_eq!(outcome.failed.len(), 1);
-        assert!(outcome.failed[0].1.contains("main worktree"));
+        let main = app.worktrees.iter().find(|w| w.main).unwrap();
+        let linked = app.worktrees.iter().find(|w| !w.main).unwrap();
+        assert!(cannot_remove(main).unwrap().contains("main worktree"));
+        assert_eq!(cannot_remove(linked), None);
+    }
+
+    #[test]
+    fn a_batch_tracks_progress_and_finishes_only_when_all_report() {
+        let mut batch = Batch::starting(3);
+        for p in ["/a", "/b", "/c"] {
+            batch.pending.insert(PathBuf::from(p));
+        }
+        assert!(batch.in_flight());
+        assert_eq!(batch.progress(), "  removing 0 of 3\u{2026}");
+
+        batch.pending.remove(&PathBuf::from("/a"));
+        batch.removed.push(PathBuf::from("/a"));
+        assert_eq!(batch.progress(), "  removing 1 of 3\u{2026}");
+        assert!(batch.in_flight(), "two are still running");
+
+        batch.pending.remove(&PathBuf::from("/b"));
+        batch
+            .failed
+            .push((PathBuf::from("/b"), "dirty".to_string()));
+        batch.pending.remove(&PathBuf::from("/c"));
+        batch.removed.push(PathBuf::from("/c"));
+        assert!(!batch.in_flight());
+
+        let summary = batch.outcome().summary();
+        assert!(summary.contains("removed 2 worktrees"), "{summary:?}");
+        assert!(summary.contains("1 refused: dirty"), "{summary:?}");
+    }
+
+    #[test]
+    fn a_worktree_we_refuse_ourselves_is_not_offered_for_forcing() {
+        // Marking everything includes the main worktree, which we never
+        // dispatch: it should not inflate the progress count, and offering to
+        // force it would just fail again.
+        let mut batch = Batch::starting(2);
+        batch.total -= 1;
+        batch.refused.push((
+            PathBuf::from("/r"),
+            "a repo's main worktree cannot be removed".to_string(),
+        ));
+        batch.pending.insert(PathBuf::from("/r/a"));
+        assert_eq!(batch.progress(), "  removing 0 of 1\u{2026}");
+
+        batch.pending.remove(&PathBuf::from("/r/a"));
+        batch.removed.push(PathBuf::from("/r/a"));
+        assert!(batch.failed.is_empty(), "nothing for the force prompt");
+        let summary = batch.outcome().summary();
+        assert!(summary.contains("removed 1 worktree"), "{summary:?}");
+        assert!(summary.contains("main worktree"), "{summary:?}");
     }
 
     #[test]

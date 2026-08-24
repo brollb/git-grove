@@ -77,6 +77,17 @@ survive re-sorting and re-filtering, and you can filter, mark, clear the filter,
 filter again, and delete the accumulated set in one go. `d` then asks to
 confirm, naming the count, and only `y` proceeds.
 
+Deleting runs in the background: an `rm -rf` of a full checkout takes a moment,
+and a batch of them takes minutes, so the list keeps drawing and taking keys
+while it works. The footer counts the batch down, the rows still going show
+`removing…`, and they leave the list together when the batch finishes rather
+than one at a time under your cursor. Keys that would leave the picker are held
+back while removals are in flight — quitting would kill them mid-`rm` — with
+`ctrl-c` still there if you mean it.
+
+Removals within one repo run one at a time so they cannot race each other's
+administrative files; separate repos run in parallel.
+
 Nothing that could lose work is deleted quietly:
 
 - A worktree with uncommitted or untracked files is refused. Those refusals come
