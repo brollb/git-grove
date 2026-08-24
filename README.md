@@ -1,7 +1,8 @@
-# git-worktrees
+# grove
 
-List the git worktrees in a directory, annotated with the number of the open
-GitHub PR for each branch.
+Browse, search and prune the git worktrees of a repo — a grove being the stand
+of trees around it. Each is annotated with the number of the open GitHub PR for
+its branch.
 
 On a TTY it opens an interactive picker — fuzzy search, multi-select, and
 deleting worktrees you are done with; piped, it prints tab-separated lines, so
@@ -25,15 +26,19 @@ the same command works in a terminal and in a script.
 cargo install --path .
 ```
 
-The binary is named `git-worktrees`, so once it is on your `PATH` git picks it
-up as a subcommand: `git worktrees`.
+That puts `grove` on your `PATH`. For it to double as a git subcommand, link it
+under the name git looks for:
+
+```sh
+ln -s "$(command -v grove)" ~/.cargo/bin/git-grove   # then: git grove
+```
 
 ## Usage
 
 ```sh
-git worktrees                  # worktrees of the repo you are standing in
-git worktrees ~/baseten        # a directory of repos: every repo beneath it
-git worktrees --json | jq .    # machine-readable
+grove                  # worktrees of the repo you are standing in
+grove ~/baseten        # a directory of repos: every repo beneath it
+grove --json | jq .    # machine-readable
 ```
 
 `DIRECTORY` defaults to the current directory. If it is inside a git repo, that
@@ -123,7 +128,7 @@ while they land.
 that shell exits, so you can hop between worktrees without retyping paths:
 
 ```sh
-alias cdw='git-worktrees --cd'
+alias cdw='grove --cd'
 ```
 
 `ctrl-d` (or `exit`) leaves the worktree shell and puts the picker back up with
@@ -136,7 +141,7 @@ To change the calling shell's own directory instead, use `--pick`, which draws
 the list on `/dev/tty` and prints only the selection to stdout:
 
 ```sh
-wt() { cd "$(git-worktrees --pick "$@")" || return; }
+wt() { cd "$(grove --pick "$@")" || return; }
 ```
 
 Cancelling exits 130 with nothing on stdout, so `cd` is left alone.

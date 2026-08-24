@@ -414,7 +414,7 @@ prunable gitdir file points to non-existent location
 
     /// A throwaway repo with one linked worktree, under the test's temp dir.
     fn scratch_repo(name: &str) -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("git-worktrees-test-{name}"));
+        let root = std::env::temp_dir().join(format!("grove-test-{name}"));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("mkdir");
         run(&root, &["init", "-q", "."]);

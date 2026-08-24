@@ -1,11 +1,11 @@
 [package]
-name = "git-worktrees"
+name = "grove"
 version = "0.1.0"
 edition = "2021"
-description = "List git worktrees, annotated with open GitHub PR numbers"
+description = "Browse, search and prune the git worktrees of a repo"
 
 [[bin]]
-name = "git-worktrees"
+name = "grove"
 path = "src/main.rs"
 
 [dependencies]

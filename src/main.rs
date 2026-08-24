@@ -1,4 +1,4 @@
-//! git-worktrees — list git worktrees, annotated with open GitHub PR numbers.
+//! grove — browse the git worktrees of a repo, annotated with open PR numbers.
 //!
 //! On a TTY it opens an interactive picker; piped, it prints tab-separated
 //! lines (or JSON with `--json`).
@@ -20,10 +20,10 @@ use app::{display_path, App, PrCell, Sort};
 use load::Loader;
 
 const USAGE: &str = "\
-git-worktrees — list git worktrees, with open PR numbers
+grove — browse, search and prune the git worktrees of a repo
 
 USAGE:
-    git-worktrees [OPTIONS] [DIRECTORY]
+    grove [OPTIONS] [DIRECTORY]
 
 DIRECTORY defaults to the current directory. If it is inside a git repo, that
 repo's worktrees are listed; otherwise every repo directly beneath it is scanned.
@@ -40,7 +40,7 @@ OPTIONS:
     -S, --sort S    order the list: name (default), recent, oldest
     -p, --pick      force the interactive picker, printing the selection to
                     stdout even when stdout is redirected
-                        cd \"$(git-worktrees --pick)\"
+                        cd \"$(grove --pick)\"
         --plain     force tab-separated output:
                         path <TAB> branch <TAB> head <TAB> pr <TAB> flags
     -j, --json      JSON output
@@ -116,7 +116,7 @@ fn parse_args() -> Result<Option<Opts>, String> {
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("git-worktrees {}", env!("CARGO_PKG_VERSION"));
+                println!("grove {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             "-j" | "--json" => opts.json = true,
@@ -153,7 +153,7 @@ fn main() -> ExitCode {
         Ok(Some(opts)) => opts,
         Ok(None) => return ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("git-worktrees: {err}\n\n{USAGE}");
+            eprintln!("grove: {err}\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -161,14 +161,14 @@ fn main() -> ExitCode {
     let dir = match std::fs::canonicalize(&opts.dir) {
         Ok(dir) => dir,
         Err(err) => {
-            eprintln!("git-worktrees: {}: {err}", opts.dir.display());
+            eprintln!("grove: {}: {err}", opts.dir.display());
             return ExitCode::from(1);
         }
     };
 
     let repos = git::discover(&dir);
     if repos.is_empty() {
-        eprintln!("git-worktrees: no git worktrees found in {}", dir.display());
+        eprintln!("grove: no git worktrees found in {}", dir.display());
         return ExitCode::from(1);
     }
 
@@ -200,7 +200,7 @@ fn main() -> ExitCode {
             }
             Ok(None) => ExitCode::from(130),
             Err(err) => {
-                eprintln!("git-worktrees: {err}");
+                eprintln!("grove: {err}");
                 ExitCode::from(1)
             }
         };
@@ -227,7 +227,7 @@ fn main() -> ExitCode {
     while outstanding > 0 {
         let now = Instant::now();
         if now >= deadline {
-            eprintln!("git-worktrees: timed out waiting for status/PR data");
+            eprintln!("grove: timed out waiting for status/PR data");
             break;
         }
         match rx.recv_timeout(deadline - now) {
@@ -236,7 +236,7 @@ fn main() -> ExitCode {
                 outstanding -= 1;
             }
             Err(_) => {
-                eprintln!("git-worktrees: timed out waiting for status/PR data");
+                eprintln!("grove: timed out waiting for status/PR data");
                 break;
             }
         }
@@ -269,13 +269,13 @@ fn shell_loop(
             Ok(Some(path)) => path,
             Ok(None) => return ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("git-worktrees: {err}");
+                eprintln!("grove: {err}");
                 return ExitCode::from(1);
             }
         };
         eprintln!("\x1b[90m\u{2192} {}\x1b[0m", path.display());
         if let Err(err) = Command::new(&shell).current_dir(&path).status() {
-            eprintln!("git-worktrees: {shell} in {}: {err}", path.display());
+            eprintln!("grove: {shell} in {}: {err}", path.display());
         }
         // Whatever happened in there, the worktree's status is now suspect.
         app.statuses.remove(&path);
