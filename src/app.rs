@@ -108,6 +108,16 @@ impl App {
         }
     }
 
+    /// Where to run `git worktree` commands affecting this worktree.
+    pub fn repo_main(&self, wt: &Worktree) -> &Path {
+        &self.repos[wt.repo].main_path
+    }
+
+    /// Drop worktrees that no longer exist, after removing them.
+    pub fn forget_worktrees(&mut self, removed: &std::collections::HashSet<PathBuf>) {
+        self.worktrees.retain(|wt| !removed.contains(&wt.path));
+    }
+
     /// When this worktree was last touched: the full status if it has loaded,
     /// otherwise the cheap estimate.
     pub fn touched(&self, wt: &Worktree) -> Option<u64> {

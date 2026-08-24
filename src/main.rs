@@ -28,9 +28,9 @@ USAGE:
 DIRECTORY defaults to the current directory. If it is inside a git repo, that
 repo's worktrees are listed; otherwise every repo directly beneath it is scanned.
 
-Interactive by default on a TTY: type to fuzzy-filter, arrows to move, enter
-prints the selected worktree path, ctrl-s cycles the sort order, ctrl-o opens
-its PR, esc clears the filter or quits.
+Interactive by default on a TTY: / opens a fuzzy filter, space marks worktrees
+and d deletes them, enter prints the selected worktree path, s cycles the sort
+order, o opens its PR, q quits.
 
 OPTIONS:
     -c, --cd        open a shell in the worktree you select, and return to the

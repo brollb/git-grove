@@ -66,6 +66,49 @@ pub fn short_sha(sha: &str) -> String {
     sha.chars().take(8).collect()
 }
 
+/// Like [`git`], but keeps git's own complaint when the command fails.
+fn git_result(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let reason = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("git failed")
+        .trim()
+        .trim_start_matches("fatal: ")
+        .to_string();
+    Err(reason)
+}
+
+/// Remove a worktree from disk and drop its administrative entry.
+///
+/// The branch is left alone: removing a worktree should not be able to lose
+/// commits. `force` passes `--force` twice, which is what git wants for a
+/// worktree that is locked as well as dirty.
+pub fn remove_worktree(repo_main: &Path, path: &Path, force: bool) -> Result<(), String> {
+    if !path.exists() {
+        // The directory is already gone; just clear the stale entry.
+        return git_result(repo_main, &["worktree", "prune"]).map(|_| ());
+    }
+    let path = path.to_string_lossy();
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+        args.push("--force");
+    }
+    args.push(&path);
+    git_result(repo_main, &args).map(|_| ())
+}
+
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -353,6 +396,84 @@ prunable gitdir file points to non-existent location
         let wts = parse_porcelain(out, 0);
         assert!(wts[0].bare);
         assert_eq!(wts[0].branch_label(), "(bare)");
+    }
+
+    fn run(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A throwaway repo with one linked worktree, under the test's temp dir.
+    fn scratch_repo(name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("git-worktrees-test-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir");
+        run(&root, &["init", "-q", "."]);
+        run(&root, &["config", "user.email", "t@example.com"]);
+        run(&root, &["config", "user.name", "Test"]);
+        run(&root, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let wt = root.join("wt");
+        run(&root, &["worktree", "add", "-q", "wt", "-b", "feature"]);
+        (root, wt)
+    }
+
+    #[test]
+    fn removes_a_clean_worktree() {
+        let (root, wt) = scratch_repo("clean");
+        assert!(wt.exists());
+        assert_eq!(remove_worktree(&root, &wt, false), Ok(()));
+        assert!(!wt.exists(), "the directory should be gone");
+        assert_eq!(list_worktrees_for_test(&root).len(), 1, "only main is left");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refuses_a_dirty_worktree_until_forced() {
+        let (root, wt) = scratch_repo("dirty");
+        std::fs::write(wt.join("scratch.txt"), "work in progress").expect("write");
+
+        let refused = remove_worktree(&root, &wt, false);
+        assert!(
+            refused.is_err(),
+            "untracked work must not be deleted silently"
+        );
+        assert!(wt.exists(), "the worktree must survive a refused removal");
+
+        assert_eq!(remove_worktree(&root, &wt, true), Ok(()));
+        assert!(!wt.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_worktree_whose_directory_vanished_is_pruned() {
+        let (root, wt) = scratch_repo("stale");
+        std::fs::remove_dir_all(&wt).expect("rm");
+        assert_eq!(
+            list_worktrees_for_test(&root).len(),
+            2,
+            "entry is still registered"
+        );
+
+        assert_eq!(remove_worktree(&root, &wt, false), Ok(()));
+        assert_eq!(
+            list_worktrees_for_test(&root).len(),
+            1,
+            "stale entry pruned"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn list_worktrees_for_test(root: &Path) -> Vec<Worktree> {
+        parse_porcelain(&git(root, &["worktree", "list", "--porcelain"]).unwrap(), 0)
     }
 
     #[test]

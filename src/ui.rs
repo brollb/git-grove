@@ -1,5 +1,6 @@
 //! Interactive worktree picker, drawn on /dev/tty.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -12,13 +13,14 @@ use crossterm::{execute, terminal};
 use crate::app::{App, PrCell, Sort};
 use crate::fuzzy::Hits;
 use crate::gh;
-use crate::git::Status;
+use crate::git::{self, Status};
 use crate::load::{Loader, Msg};
 
 const RESET: &str = "\x1b[0m";
 const CYAN: &str = "36";
 const MAGENTA: &str = "35";
 const YELLOW: &str = "33";
+const GREEN: &str = "32";
 const RED: &str = "31";
 const DIM: &str = "90";
 const BOLD: &str = "1";
@@ -30,6 +32,21 @@ enum Row {
     Item(usize, Hits),
 }
 
+/// The picker is modal: keys are commands until `/` opens the filter.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Normal,
+    Search,
+}
+
+/// A destructive action waiting on a keypress.
+enum Prompt {
+    /// Remove these worktrees?
+    Delete(Vec<PathBuf>),
+    /// git refused these; force them, losing whatever is in them?
+    Force(Vec<PathBuf>),
+}
+
 /// Query and cursor, kept across picker visits so that returning from a
 /// worktree shell (`--cd`) lands you back where you were.
 #[derive(Default)]
@@ -37,6 +54,9 @@ pub struct PickerState {
     pub query: String,
     sel: usize,
     off: usize,
+    /// Worktrees marked with space, by path so that marks survive the list
+    /// being re-sorted, re-filtered, or having rows removed.
+    marked: HashSet<PathBuf>,
 }
 
 impl PickerState {
@@ -94,6 +114,9 @@ pub fn run(
     }
     let mut off = state.off;
     let mut dirty = true;
+    let mut mode = Mode::Normal;
+    let mut prompt: Option<Prompt> = None;
+    let mut message: Option<String> = None;
     let selected;
 
     loop {
@@ -119,7 +142,19 @@ pub fn run(
         }
 
         if dirty {
-            draw(&mut tty, app, &rows, &state.query, sel, off, view, width)?;
+            let frame = Frame {
+                rows: &rows,
+                query: &state.query,
+                mode,
+                sel,
+                off,
+                view,
+                width,
+                marked: &state.marked,
+                prompt: prompt.as_ref(),
+                message: message.as_deref(),
+            };
+            draw(&mut tty, app, &frame)?;
             dirty = false;
         }
 
@@ -129,80 +164,175 @@ pub fn run(
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     let alt = key.modifiers.contains(KeyModifiers::ALT);
                     let mut requery = false;
-                    match key.code {
-                        KeyCode::Char('c' | 'd') if ctrl => {
-                            selected = None;
-                            break;
+                    // Any keypress clears the last result line.
+                    message = None;
+
+                    if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')) {
+                        selected = None;
+                        break;
+                    }
+
+                    if let Some(pending) = prompt.take() {
+                        // A confirmation is up: only its own answers count, and
+                        // anything else dismisses it without acting.
+                        match (&pending, key.code) {
+                            (Prompt::Delete(targets), KeyCode::Char('y' | 'Y'))
+                            | (Prompt::Force(targets), KeyCode::Char('f' | 'F')) => {
+                                let force = matches!(pending, Prompt::Force(_));
+                                let outcome = remove_all(app, targets, force);
+                                let removed: HashSet<PathBuf> =
+                                    outcome.removed.iter().cloned().collect();
+                                app.forget_worktrees(&removed);
+                                state.marked.retain(|p| !removed.contains(p));
+                                for path in &removed {
+                                    loader.forget(path);
+                                }
+                                message = Some(outcome.summary());
+                                if !outcome.failed.is_empty() && !force {
+                                    prompt = Some(Prompt::Force(
+                                        outcome.failed.iter().map(|(p, _)| p.clone()).collect(),
+                                    ));
+                                }
+                                requery = true;
+                            }
+                            _ => message = Some("  cancelled".to_string()),
                         }
-                        KeyCode::Esc => {
-                            if state.query.is_empty() {
+                    } else if mode == Mode::Search {
+                        match key.code {
+                            KeyCode::Enter | KeyCode::Esc => mode = Mode::Normal,
+                            KeyCode::Char('u') if ctrl => {
+                                state.query.clear();
+                                requery = true;
+                            }
+                            KeyCode::Char('w') if ctrl => {
+                                let trimmed = state.query.trim_end();
+                                let cut = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
+                                state.query.truncate(cut);
+                                requery = true;
+                            }
+                            KeyCode::Backspace => {
+                                state.query.pop();
+                                requery = true;
+                            }
+                            KeyCode::Up => sel = step(&rows, sel, -1),
+                            KeyCode::Down => sel = step(&rows, sel, 1),
+                            KeyCode::Char('p') if ctrl => sel = step(&rows, sel, -1),
+                            KeyCode::Char('n') if ctrl => sel = step(&rows, sel, 1),
+                            KeyCode::Char(c) if !ctrl && !alt => {
+                                state.query.push(c);
+                                requery = true;
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Char('/') => mode = Mode::Search,
+                            KeyCode::Char('q') => {
                                 selected = None;
                                 break;
                             }
-                            state.query.clear();
-                            requery = true;
-                        }
-                        KeyCode::Enter => {
-                            if let Some(Row::Item(i, _)) = rows.get(sel) {
-                                selected = Some(app.worktrees[*i].path.clone());
-                                break;
+                            KeyCode::Esc => {
+                                if state.query.is_empty() {
+                                    selected = None;
+                                    break;
+                                }
+                                state.query.clear();
+                                requery = true;
                             }
-                        }
-                        KeyCode::Char('u') if ctrl => {
-                            state.query.clear();
-                            requery = true;
-                        }
-                        KeyCode::Char('w') if ctrl => {
-                            let trimmed = state.query.trim_end();
-                            let cut = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
-                            state.query.truncate(cut);
-                            requery = true;
-                        }
-                        KeyCode::Backspace => {
-                            state.query.pop();
-                            requery = true;
-                        }
-                        KeyCode::Char('s') if ctrl => {
-                            app.sort = app.sort.next();
-                            if app.sort != Sort::Name {
-                                // Sorting by age needs every row dated, not
-                                // just the ones on screen.
-                                for wt in &app.worktrees {
-                                    loader.request_age(&wt.path);
+                            KeyCode::Enter => {
+                                if let Some(Row::Item(i, _)) = rows.get(sel) {
+                                    selected = Some(app.worktrees[*i].path.clone());
+                                    break;
                                 }
                             }
-                            // Rebuilding resets the cursor to the top, which
-                            // is the point of asking for newest/oldest first.
-                            // (A re-sort from data arriving in the background
-                            // keeps your place instead — see below.)
-                            requery = true;
-                        }
-                        KeyCode::Char('o') if ctrl => {
-                            if let Some(Row::Item(i, _)) = rows.get(sel) {
-                                if let PrCell::Open(pr) = app.pr_for(&app.worktrees[*i]) {
-                                    gh::open_url(&pr.url);
+                            KeyCode::Char(' ') => {
+                                if let Some(Row::Item(i, _)) = rows.get(sel) {
+                                    let path = app.worktrees[*i].path.clone();
+                                    if !state.marked.remove(&path) {
+                                        state.marked.insert(path);
+                                    }
+                                    // Fall down a row, so a run of worktrees
+                                    // can be marked with repeated taps.
+                                    sel = step(&rows, sel, 1);
                                 }
                             }
+                            KeyCode::Char('a') => {
+                                let visible: Vec<PathBuf> = rows
+                                    .iter()
+                                    .filter_map(|r| match r {
+                                        Row::Item(i, _) => Some(app.worktrees[*i].path.clone()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                // All already marked → unmark; otherwise mark the rest.
+                                if visible.iter().all(|p| state.marked.contains(p)) {
+                                    for path in &visible {
+                                        state.marked.remove(path);
+                                    }
+                                } else {
+                                    state.marked.extend(visible);
+                                }
+                            }
+                            KeyCode::Char('d') => {
+                                let targets = delete_targets(app, &state.marked, &rows, sel);
+                                if targets.is_empty() {
+                                    message = Some("  nothing to delete".to_string());
+                                } else {
+                                    prompt = Some(Prompt::Delete(targets));
+                                }
+                            }
+                            KeyCode::Char('s') => {
+                                app.sort = app.sort.next();
+                                if app.sort != Sort::Name {
+                                    for wt in &app.worktrees {
+                                        loader.request_age(&wt.path);
+                                    }
+                                }
+                                // Rebuilding resets the cursor to the top, which
+                                // is the point of asking for newest/oldest first.
+                                // (A re-sort from data arriving in the background
+                                // keeps your place instead — see below.)
+                                requery = true;
+                            }
+                            KeyCode::Char('o') => {
+                                if let Some(Row::Item(i, _)) = rows.get(sel) {
+                                    if let PrCell::Open(pr) = app.pr_for(&app.worktrees[*i]) {
+                                        gh::open_url(&pr.url);
+                                    }
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => sel = step(&rows, sel, -1),
+                            KeyCode::Down | KeyCode::Char('j') => sel = step(&rows, sel, 1),
+                            KeyCode::Char('p') if ctrl => sel = step(&rows, sel, -1),
+                            KeyCode::Char('n') if ctrl => sel = step(&rows, sel, 1),
+                            KeyCode::PageUp => sel = jump(&rows, sel, -(view as isize)),
+                            KeyCode::PageDown => sel = jump(&rows, sel, view as isize),
+                            KeyCode::Home | KeyCode::Char('g') => sel = first_item(&rows),
+                            KeyCode::End | KeyCode::Char('G') => sel = last_item(&rows),
+                            _ => {}
                         }
-                        KeyCode::Up => sel = step(&rows, sel, -1),
-                        KeyCode::Down => sel = step(&rows, sel, 1),
-                        KeyCode::Char('p') if ctrl => sel = step(&rows, sel, -1),
-                        KeyCode::Char('n') if ctrl => sel = step(&rows, sel, 1),
-                        KeyCode::PageUp => sel = jump(&rows, sel, -(view as isize)),
-                        KeyCode::PageDown => sel = jump(&rows, sel, view as isize),
-                        KeyCode::Home => sel = first_item(&rows),
-                        KeyCode::End => sel = last_item(&rows),
-                        // Anything else printable extends the query.
-                        KeyCode::Char(c) if !ctrl && !alt => {
-                            state.query.push(c);
-                            requery = true;
-                        }
-                        _ => {}
                     }
+
                     if requery {
+                        let keep = match rows.get(sel) {
+                            Some(Row::Item(i, _)) => app.worktrees.get(*i).map(|w| w.path.clone()),
+                            _ => None,
+                        };
                         rows = build_rows(app, &state.query);
-                        sel = first_item(&rows);
-                        off = 0;
+                        // After a delete the cursor should stay put; after a
+                        // query or sort change it belongs at the top.
+                        sel = if message.is_some() {
+                            keep.and_then(|path| {
+                                rows.iter().position(
+                                    |r| matches!(r, Row::Item(i, _) if app.worktrees[*i].path == path),
+                                )
+                            })
+                            .unwrap_or_else(|| first_item(&rows))
+                        } else {
+                            off = 0;
+                            first_item(&rows)
+                        };
+                        sel = sel.min(rows.len().saturating_sub(1));
                     }
                     dirty = true;
                 }
@@ -241,6 +371,71 @@ pub fn run(
     state.sel = sel;
     state.off = off;
     Ok(selected)
+}
+
+/// What `d` acts on: everything marked, or the row under the cursor when
+/// nothing is marked.
+fn delete_targets(app: &App, marked: &HashSet<PathBuf>, rows: &[Row], sel: usize) -> Vec<PathBuf> {
+    if !marked.is_empty() {
+        // Follow list order rather than the set's, so messages read sensibly.
+        return app
+            .worktrees
+            .iter()
+            .filter(|wt| marked.contains(&wt.path))
+            .map(|wt| wt.path.clone())
+            .collect();
+    }
+    match rows.get(sel) {
+        Some(Row::Item(i, _)) => vec![app.worktrees[*i].path.clone()],
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Default)]
+struct Removal {
+    removed: Vec<PathBuf>,
+    failed: Vec<(PathBuf, String)>,
+}
+
+impl Removal {
+    fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.removed.is_empty() {
+            parts.push(format!(
+                "removed {} worktree{}",
+                self.removed.len(),
+                if self.removed.len() == 1 { "" } else { "s" }
+            ));
+        }
+        if let Some((_, reason)) = self.failed.first() {
+            parts.push(format!("{} refused: {reason}", self.failed.len()));
+        }
+        if parts.is_empty() {
+            parts.push("nothing removed".to_string());
+        }
+        format!("  {}", parts.join("  \u{b7}  "))
+    }
+}
+
+fn remove_all(app: &App, targets: &[PathBuf], force: bool) -> Removal {
+    let mut outcome = Removal::default();
+    for target in targets {
+        let Some(wt) = app.worktrees.iter().find(|w| &w.path == target) else {
+            continue;
+        };
+        if wt.main {
+            outcome.failed.push((
+                target.clone(),
+                "a repo's main worktree cannot be removed".to_string(),
+            ));
+            continue;
+        }
+        match git::remove_worktree(app.repo_main(wt), target, force) {
+            Ok(()) => outcome.removed.push(target.clone()),
+            Err(reason) => outcome.failed.push((target.clone(), reason)),
+        }
+    }
+    outcome
 }
 
 fn build_rows(app: &App, query: &str) -> Vec<Row> {
@@ -332,7 +527,7 @@ fn widths(app: &App, total: usize) -> Widths {
     let pr = 7;
     let status = 14;
     let age = 5;
-    let fixed = 2 + pr + 2 + status + 2 + age + 2 + 2; // marker + gaps
+    let fixed = 3 + pr + 2 + status + 2 + age + 2 + 2; // gutter + gaps
     let flex = total.saturating_sub(fixed).max(20);
     let longest = app
         .worktrees
@@ -350,17 +545,21 @@ fn widths(app: &App, total: usize) -> Widths {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw(
-    tty: &mut File,
-    app: &App,
-    rows: &[Row],
-    query: &str,
+struct Frame<'a> {
+    rows: &'a [Row],
+    query: &'a str,
+    mode: Mode,
     sel: usize,
     off: usize,
     view: usize,
     width: usize,
-) -> io::Result<()> {
+    marked: &'a HashSet<PathBuf>,
+    prompt: Option<&'a Prompt>,
+    message: Option<&'a str>,
+}
+
+fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
+    let (rows, sel, off, view, width) = (f.rows, f.sel, f.off, f.view, f.width);
     let w = widths(app, width);
     let color = app.color;
     let now = unix_now();
@@ -395,14 +594,14 @@ fn draw(
         },
     );
     line(&mut buf, &paint(BOLD, &fit(&title, width), color));
-    line(&mut buf, &prompt_line(query, rows, total, width, color));
+    line(&mut buf, &search_line(f, rows, total, width, color));
     line(
         &mut buf,
         &paint(
             DIM,
             &fit(
                 &format!(
-                    "  {}  {}  {}  {}  {}",
+                    "   {}  {}  {}  {}  {}",
                     fit("PR", w.pr),
                     fit("BRANCH", w.branch),
                     fit("STATUS", w.status),
@@ -434,7 +633,12 @@ fn draw(
                 let age_cell = fit_right(&age_text(status, now), w.age);
                 let branch = wt.branch_label();
                 let path = crate::app::display_path(&wt.path, Some(&app.root));
-                let marker = if selected { "\u{25b8} " } else { "  " };
+                let marked = f.marked.contains(&wt.path);
+                let marker = format!(
+                    "{}{} ",
+                    if selected { "\u{25b8}" } else { " " },
+                    if marked { "\u{25cf}" } else { " " }
+                );
 
                 if selected {
                     // Reverse video over the whole row, so per-cell colors (and
@@ -449,6 +653,11 @@ fn draw(
                     );
                     line(&mut buf, &paint("7", &plain, color));
                 } else if color {
+                    let marker = if marked {
+                        format!("{} ", paint(GREEN, marker.trim_end(), true))
+                    } else {
+                        marker.clone()
+                    };
                     let styled = format!(
                         "{marker}{}  {}  {}  {}  {}",
                         paint(pr_color(app.pr_for(wt)), &pr_cell, true),
@@ -491,39 +700,71 @@ fn draw(
         _ => String::new(),
     };
     line(&mut buf, &fit(&detail, width));
-    line(
-        &mut buf,
-        &paint(
-            DIM,
-            &fit(
-                "  type to filter  ·  \u{2191}/\u{2193} move  ·  enter: select  ·  ctrl-s: sort  ·  ctrl-o: PR  ·  esc: clear/quit",
-                width,
-            ),
-            color,
-        ),
-    );
+    let footer = match (f.prompt, f.message) {
+        (Some(prompt), _) => paint(YELLOW, &fit(&prompt_text(prompt), width), color),
+        (None, Some(message)) => fit(message, width),
+        (None, None) => paint(DIM, &fit(hints(f.mode), width), color),
+    };
+    line(&mut buf, &footer);
 
     buf.push_str("\x1b[J"); // clear anything below
     tty.write_all(buf.as_bytes())?;
     tty.flush()
 }
 
-fn prompt_line(query: &str, rows: &[Row], total: usize, width: usize, color: bool) -> String {
+/// The line under the title: the filter, or an invitation to open it.
+fn search_line(f: &Frame, rows: &[Row], total: usize, width: usize, color: bool) -> String {
     let shown = rows.iter().filter(|r| matches!(r, Row::Item(..))).count();
-    let counts = format!("{shown}/{total} ");
-    let left = if query.is_empty() {
-        format!(" \u{203a} {}", paint(DIM, "type to filter", color))
+    // The mark count lives here rather than in the title, which is the first
+    // thing to be truncated when the path is long.
+    let counts = if f.marked.is_empty() {
+        format!("{shown}/{total} ")
     } else {
-        format!(" \u{203a} {query}\u{258c}")
+        format!("{} marked  \u{b7}  {shown}/{total} ", f.marked.len())
     };
-    // `left` may carry escape codes, so pad against its printable width.
-    let printable = if query.is_empty() {
-        3 + "type to filter".chars().count()
-    } else {
-        3 + query.chars().count() + 1
+    let (left, printable) = match (f.mode, f.query.is_empty()) {
+        (Mode::Search, _) => (
+            format!(" /{}\u{258c}", f.query),
+            2 + f.query.chars().count() + 1,
+        ),
+        (Mode::Normal, false) => (
+            format!(" {}", paint(DIM, &format!("/{}", f.query), color)),
+            2 + f.query.chars().count(),
+        ),
+        (Mode::Normal, true) => (
+            format!(" {}", paint(DIM, "press / to search", color)),
+            1 + "press / to search".chars().count(),
+        ),
     };
     let gap = width.saturating_sub(printable + counts.chars().count());
     format!("{left}{}{}", " ".repeat(gap), paint(DIM, &counts, color))
+}
+
+fn prompt_text(prompt: &Prompt) -> String {
+    match prompt {
+        Prompt::Delete(targets) => format!(
+            "  delete {} worktree{} from disk?  [y] yes   [any other key] cancel",
+            targets.len(),
+            if targets.len() == 1 { "" } else { "s" }
+        ),
+        Prompt::Force(targets) => format!(
+            "  force-remove {} worktree{}, losing uncommitted work in {}?  [f] yes   [any other key] cancel",
+            targets.len(),
+            if targets.len() == 1 { "" } else { "s" },
+            if targets.len() == 1 { "it" } else { "them" }
+        ),
+    }
+}
+
+fn hints(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Normal => {
+            "  /: search  \u{b7}  space: mark  \u{b7}  d: delete  \u{b7}  enter: select  \u{b7}  s: sort  \u{b7}  o: PR  \u{b7}  q: quit"
+        }
+        Mode::Search => {
+            "  type to filter  \u{b7}  enter/esc: back to the list  \u{b7}  \u{2191}/\u{2193}: move"
+        }
+    }
 }
 
 fn line(buf: &mut String, s: &str) {
@@ -948,12 +1189,156 @@ mod tests {
         assert_eq!(age_text(Some(&touched), now), "2h");
     }
 
-    #[test]
-    fn prompt_line_is_exactly_one_row_wide() {
-        let rows = vec![Row::Item(0, Hits::default())];
-        for query in ["", "loops", "a b"] {
-            let out = prompt_line(query, &rows, 42, 60, true);
-            assert_eq!(visible(&out).chars().count(), 60, "query {query:?}");
+    fn frame<'a>(query: &'a str, mode: Mode, marked: &'a HashSet<PathBuf>) -> Frame<'a> {
+        Frame {
+            rows: &[],
+            query,
+            mode,
+            sel: 0,
+            off: 0,
+            view: 10,
+            width: 60,
+            marked,
+            prompt: None,
+            message: None,
         }
+    }
+
+    #[test]
+    fn search_line_is_exactly_one_row_wide_in_every_mode() {
+        let rows = vec![Row::Item(0, Hits::default())];
+        let marked = HashSet::new();
+        for mode in [Mode::Normal, Mode::Search] {
+            for query in ["", "loops", "a b"] {
+                let f = frame(query, mode, &marked);
+                let out = search_line(&f, &rows, 42, 60, true);
+                assert_eq!(visible(&out).chars().count(), 60, "{query:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn search_line_says_how_to_start_searching() {
+        let marked = HashSet::new();
+        let rows = vec![Row::Item(0, Hits::default())];
+        let idle = visible(&search_line(
+            &frame("", Mode::Normal, &marked),
+            &rows,
+            1,
+            60,
+            false,
+        ));
+        assert!(idle.contains("press / to search"), "{idle:?}");
+        // A filter that is applied but not being edited still shows itself.
+        let applied = visible(&search_line(
+            &frame("loops", Mode::Normal, &marked),
+            &rows,
+            1,
+            60,
+            false,
+        ));
+        assert!(applied.contains("/loops"), "{applied:?}");
+        assert!(!applied.contains('\u{258c}'), "no caret when not editing");
+        let editing = visible(&search_line(
+            &frame("loops", Mode::Search, &marked),
+            &rows,
+            1,
+            60,
+            false,
+        ));
+        assert!(editing.contains("/loops\u{258c}"), "{editing:?}");
+    }
+
+    fn app_with(paths: &[&str]) -> App {
+        use crate::git::{Repo, Worktree};
+        let worktrees: Vec<Worktree> = paths
+            .iter()
+            .enumerate()
+            .map(|(n, p)| Worktree {
+                path: PathBuf::from(p),
+                head: "abc".to_string(),
+                branch: Some(format!("b{n}")),
+                bare: false,
+                detached: false,
+                locked: false,
+                prunable: false,
+                repo: 0,
+                main: n == 0,
+            })
+            .collect();
+        let repo = Repo {
+            label: "r".to_string(),
+            main_path: PathBuf::from("/r"),
+            worktrees,
+        };
+        App::new(vec![repo], PathBuf::from("/r"), false, false)
+    }
+
+    #[test]
+    fn delete_acts_on_the_marks_or_else_the_cursor() {
+        let app = app_with(&["/r", "/r/a", "/r/b"]);
+        let rows = build_rows(&app, "");
+        let cursor_on = |sel: usize| match &rows[sel] {
+            Row::Item(i, _) => app.worktrees[*i].path.clone(),
+            _ => panic!("not an item"),
+        };
+
+        // Nothing marked: just the row under the cursor.
+        let empty = HashSet::new();
+        assert_eq!(delete_targets(&app, &empty, &rows, 1), vec![cursor_on(1)]);
+
+        // Marked rows win, and come back in list order regardless of the
+        // order they were marked in.
+        let marked: HashSet<PathBuf> = [PathBuf::from("/r/b"), PathBuf::from("/r/a")]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            delete_targets(&app, &marked, &rows, 0),
+            vec![PathBuf::from("/r/a"), PathBuf::from("/r/b")],
+            "the cursor row is ignored when marks exist"
+        );
+    }
+
+    #[test]
+    fn the_main_worktree_is_never_removed() {
+        let app = app_with(&["/r", "/r/a"]);
+        let outcome = remove_all(&app, &[PathBuf::from("/r")], true);
+        assert!(outcome.removed.is_empty());
+        assert_eq!(outcome.failed.len(), 1);
+        assert!(outcome.failed[0].1.contains("main worktree"));
+    }
+
+    #[test]
+    fn confirmations_name_what_will_happen() {
+        let one = prompt_text(&Prompt::Delete(vec![PathBuf::from("/a")]));
+        assert!(one.contains("delete 1 worktree from disk?"), "{one:?}");
+        let many = prompt_text(&Prompt::Delete(vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+        ]));
+        assert!(many.contains("delete 2 worktrees"), "{many:?}");
+        // Forcing has to spell out that work is lost.
+        let forced = prompt_text(&Prompt::Force(vec![PathBuf::from("/a")]));
+        assert!(forced.contains("losing uncommitted work"), "{forced:?}");
+        assert!(forced.contains("[f]"), "{forced:?}");
+    }
+
+    #[test]
+    fn removal_summary_reports_both_halves() {
+        let mut outcome = Removal::default();
+        assert!(outcome.summary().contains("nothing removed"));
+        outcome.removed.push(PathBuf::from("/a"));
+        assert!(outcome.summary().contains("removed 1 worktree"));
+        outcome.removed.push(PathBuf::from("/b"));
+        assert!(outcome.summary().contains("removed 2 worktrees"));
+        outcome
+            .failed
+            .push((PathBuf::from("/c"), "contains modified files".to_string()));
+        let summary = outcome.summary();
+        assert!(summary.contains("removed 2 worktrees"), "{summary:?}");
+        assert!(
+            summary.contains("1 refused: contains modified files"),
+            "{summary:?}"
+        );
     }
 }

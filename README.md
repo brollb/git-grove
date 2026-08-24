@@ -3,19 +3,20 @@
 List the git worktrees in a directory, annotated with the number of the open
 GitHub PR for each branch.
 
-On a TTY it opens an interactive picker with fuzzy search; piped, it prints
-tab-separated lines, so the same command works in a terminal and in a script.
+On a TTY it opens an interactive picker — fuzzy search, multi-select, and
+deleting worktrees you are done with; piped, it prints tab-separated lines, so
+the same command works in a terminal and in a script.
 
 ```
  23 worktrees in ~/baseten/trainers  ·  8 with an open PR
- › loops worker▌                                                          3/23
-  PR       BRANCH                                    STATUS          AGE  PATH
-▸ #837     brollb/loops-worker                       ↑3                2h  …/brollb+loops-worker
-  #1003    brollb/loops-worker-drop-storage-dir      clean             3d  …/loops-harness-fixes
-  -        brollb/pickable-sampling-client           ↓12 ●1            5w  …/brollb/pickable-sampling-client
+ /loops worker                                              2 marked  ·  3/23
+   PR       BRANCH                                   STATUS          AGE  PATH
+▸  #837     brollb/loops-worker                      ↑3                2h  …/brollb+loops-worker
+ ● #1003    brollb/loops-worker-drop-storage-dir     clean             3d  …/loops-harness-fixes
+ ● -        brollb/pickable-sampling-client          ↓12 ●1            5w  …/brollb/pickable-sampling-client
 
   modified 2 hours ago  ·  #837 (draft) feat(loops): real Megatron worker behind the broker
-  type to filter  ·  ↑/↓ move  ·  enter: select  ·  ctrl-o: open PR  ·  esc: clear/quit
+  /: search  ·  space: mark  ·  d: delete  ·  enter: select  ·  s: sort  ·  o: PR  ·  q: quit
 ```
 
 ## Install
@@ -39,28 +40,58 @@ git worktrees --json | jq .    # machine-readable
 repo's worktrees are listed. Otherwise every repo directly beneath it is
 scanned, grouped by repo — handy for a `~/src`-style directory.
 
-### Searching
+### Keys
 
-Just type: the query fuzzy-matches the branch, path, PR number and (when more
-than one repo is listed) the repo name, best match first, with the matched
-characters highlighted. Space-separated tokens all have to match, so
-`trainers loops` narrows to loops branches in the trainers repo, and `837`
-finds a worktree by its PR number.
+The picker is modal: keys are commands until `/` opens the filter, which leaves
+the letters free for acting on the list.
 
 | Key | |
 | --- | --- |
-| *any character* | extend the filter |
-| `↑` `↓`, `ctrl-p` `ctrl-n`, `PgUp` `PgDn`, `Home` `End` | move |
+| `/` | open the fuzzy filter |
+| `j` `k`, `↑` `↓`, `ctrl-p` `ctrl-n`, `PgUp` `PgDn`, `g` `G` | move |
+| `space` | mark the worktree under the cursor, and move down |
+| `a` | mark every listed worktree, or unmark them if they already are |
+| `d` | delete the marked worktrees — or the one under the cursor |
 | `enter` | select |
-| `ctrl-s` | cycle the sort: by name → newest first → oldest first |
-| `ctrl-o` | open the PR in a browser |
-| `backspace`, `ctrl-w`, `ctrl-u` | delete a character, a word, the query |
-| `esc` | clear the query, or quit when it is already empty |
-| `ctrl-c`, `ctrl-d` | quit |
+| `s` | cycle the sort: by name → newest first → oldest first |
+| `o` | open the PR in a browser |
+| `esc` | clear the filter, or quit when there is none |
+| `q`, `ctrl-c`, `ctrl-d` | quit |
+
+While the filter is open, typing extends it, `backspace`/`ctrl-w`/`ctrl-u`
+delete a character/word/all of it, the arrows still move, and `enter` or `esc`
+returns to the list with the filter still applied. `esc` from there clears it.
+
+### Searching
+
+`/` fuzzy-matches the branch, path, PR number and (when more than one repo is
+listed) the repo name, best match first, with the matched characters
+highlighted. Space-separated tokens all have to match, so `trainers loops`
+narrows to loops branches in the trainers repo, and `837` finds a worktree by
+its PR number.
+
+### Deleting worktrees
+
+`space` marks worktrees — the marks are on the worktrees themselves, so they
+survive re-sorting and re-filtering, and you can filter, mark, clear the filter,
+filter again, and delete the accumulated set in one go. `d` then asks to
+confirm, naming the count, and only `y` proceeds.
+
+Nothing that could lose work is deleted quietly:
+
+- A worktree with uncommitted or untracked files is refused. Those refusals come
+  back as a second prompt offering to force exactly the ones that failed, which
+  says in as many words that the uncommitted work goes with them; only `f`
+  proceeds.
+- The branch is never touched, so nothing committed can be lost — only
+  `git worktree remove` runs.
+- A repo's main worktree is never removed, marked or not.
+- A worktree whose directory is already gone is pruned rather than reported as
+  an error, which is how `prunable` rows get cleaned up.
 
 ### Sorting
 
-`ctrl-s` cycles the order between by name (repo order, main worktree first),
+`s` cycles the order between by name (repo order, main worktree first),
 newest first, and oldest first — the last being the one to reach for when
 deciding what to prune. `--sort recent|oldest|name` sets it from the command
 line, for the picker and for `--plain`/`--json` alike.
