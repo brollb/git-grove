@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
 
-use crate::app::{App, PrCell};
+use crate::app::{App, PrCell, Sort};
 use crate::fuzzy::Hits;
 use crate::gh;
 use crate::git::Status;
@@ -82,6 +82,11 @@ pub fn run(
     terminal::enable_raw_mode()?;
     execute!(tty, terminal::EnterAlternateScreen, crossterm::cursor::Hide)?;
 
+    if app.sort != Sort::Name {
+        for wt in &app.worktrees {
+            loader.request_age(&wt.path);
+        }
+    }
     let mut rows = build_rows(app, &state.query);
     let mut sel = state.sel.min(rows.len().saturating_sub(1));
     if !matches!(rows.get(sel), Some(Row::Item(..))) {
@@ -108,6 +113,7 @@ pub fn run(
                 let path = &app.worktrees[*i].path;
                 if !app.statuses.contains_key(path) {
                     loader.request_status(path);
+                    loader.request_age(path);
                 }
             }
         }
@@ -156,6 +162,21 @@ pub fn run(
                             state.query.pop();
                             requery = true;
                         }
+                        KeyCode::Char('s') if ctrl => {
+                            app.sort = app.sort.next();
+                            if app.sort != Sort::Name {
+                                // Sorting by age needs every row dated, not
+                                // just the ones on screen.
+                                for wt in &app.worktrees {
+                                    loader.request_age(&wt.path);
+                                }
+                            }
+                            // Rebuilding resets the cursor to the top, which
+                            // is the point of asking for newest/oldest first.
+                            // (A re-sort from data arriving in the background
+                            // keeps your place instead — see below.)
+                            requery = true;
+                        }
                         KeyCode::Char('o') if ctrl => {
                             if let Some(Row::Item(i, _)) = rows.get(sel) {
                                 if let PrCell::Open(pr) = app.pr_for(&app.worktrees[*i]) {
@@ -191,18 +212,29 @@ pub fn run(
         }
 
         let mut prs_arrived = false;
+        let mut ages_arrived = false;
         while let Ok(msg) = rx.try_recv() {
             prs_arrived |= matches!(msg, Msg::Prs(..));
+            ages_arrived |= matches!(msg, Msg::Age(..) | Msg::Status(..));
             app.apply(msg);
             dirty = true;
         }
-        // PR numbers are searchable, so late-arriving PRs can change the match set.
-        if prs_arrived && !state.query.trim().is_empty() {
+        // PR numbers are searchable, so late-arriving PRs can change the match
+        // set; newly dated rows can change a recency sort's order.
+        let resort = ages_arrived && app.sort != Sort::Name;
+        if resort || (prs_arrived && !state.query.trim().is_empty()) {
+            let keep = match rows.get(sel) {
+                Some(Row::Item(i, _)) => Some(*i),
+                _ => None,
+            };
             rows = build_rows(app, &state.query);
-            sel = sel.min(rows.len().saturating_sub(1));
-            if !matches!(rows.get(sel), Some(Row::Item(..))) {
-                sel = first_item(&rows);
-            }
+            // Follow the selected worktree to wherever the new order put it.
+            sel = keep
+                .and_then(|k| {
+                    rows.iter()
+                        .position(|r| matches!(r, Row::Item(i, _) if *i == k))
+                })
+                .unwrap_or_else(|| first_item(&rows));
         }
     }
 
@@ -341,8 +373,18 @@ fn draw(
         .iter()
         .filter(|wt| matches!(app.pr_for(wt), PrCell::Open(_)))
         .count();
+    let sort_note = if app.sort == Sort::Name {
+        String::new()
+    } else {
+        let undated = app.undated();
+        if undated > 0 {
+            format!("  ·  {}, dating {undated}\u{2026}", app.sort.label())
+        } else {
+            format!("  ·  {}", app.sort.label())
+        }
+    };
     let title = format!(
-        " {} worktree{} in {}{}",
+        " {} worktree{} in {}{}{sort_note}",
         total,
         if total == 1 { "" } else { "s" },
         crate::app::display_path(&app.root, None),
@@ -454,7 +496,7 @@ fn draw(
         &paint(
             DIM,
             &fit(
-                "  type to filter  ·  \u{2191}/\u{2193} move  ·  enter: select  ·  ctrl-o: open PR  ·  esc: clear/quit",
+                "  type to filter  ·  \u{2191}/\u{2193} move  ·  enter: select  ·  ctrl-s: sort  ·  ctrl-o: PR  ·  esc: clear/quit",
                 width,
             ),
             color,

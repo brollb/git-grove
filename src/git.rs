@@ -219,6 +219,21 @@ fn mtime_secs(path: &Path) -> Option<u64> {
 /// answer any truer.
 const MAX_STATS: usize = 200;
 
+/// A cheap lower bound on [`Status::touched`]: the HEAD commit date and the
+/// worktree directory's own mtime, without the `git status` scan.
+///
+/// A full status costs ~0.1s per worktree in a large repo and contends badly
+/// when run across hundreds of them; this costs a `git log -1` and a stat, so
+/// the whole set can be dated in well under a second and sorted by age. The
+/// full status refines the value upward when it arrives.
+pub fn age(path: &Path) -> Option<u64> {
+    if !path.exists() {
+        return None;
+    }
+    let commit = git(path, &["log", "-1", "--format=%ct"]).and_then(|o| o.trim().parse().ok());
+    mtime_secs(path).max(commit)
+}
+
 pub fn status(path: &Path) -> Status {
     let mut s = Status::default();
     if !path.exists() {

@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
-use app::{display_path, App, PrCell};
+use app::{display_path, App, PrCell, Sort};
 use load::Loader;
 
 const USAGE: &str = "\
@@ -29,14 +29,15 @@ DIRECTORY defaults to the current directory. If it is inside a git repo, that
 repo's worktrees are listed; otherwise every repo directly beneath it is scanned.
 
 Interactive by default on a TTY: type to fuzzy-filter, arrows to move, enter
-prints the selected worktree path, ctrl-o opens its PR, esc clears the filter
-or quits.
+prints the selected worktree path, ctrl-s cycles the sort order, ctrl-o opens
+its PR, esc clears the filter or quits.
 
 OPTIONS:
     -c, --cd        open a shell in the worktree you select, and return to the
                     picker when that shell exits (ctrl-d)
     -q, --query Q   start with the filter box pre-filled; filters --plain and
                     --json output too
+    -S, --sort S    order the list: name (default), recent, oldest
     -p, --pick      force the interactive picker, printing the selection to
                     stdout even when stdout is redirected
                         cd \"$(git-worktrees --pick)\"
@@ -65,6 +66,7 @@ struct Opts {
     prs: bool,
     status: bool,
     query: String,
+    sort: Sort,
 }
 
 fn parse_args() -> Result<Option<Opts>, String> {
@@ -77,14 +79,28 @@ fn parse_args() -> Result<Option<Opts>, String> {
         prs: true,
         status: false,
         query: String::new(),
+        sort: Sort::default(),
     };
     let mut dir_set = false;
     let mut want_query = false;
+    let mut want_sort = false;
 
     for arg in env::args().skip(1) {
         if want_query {
             opts.query = arg;
             want_query = false;
+            continue;
+        }
+        if want_sort {
+            opts.sort = Sort::parse(&arg).ok_or(format!("unknown sort: {arg}"))?;
+            want_sort = false;
+            continue;
+        }
+        if let Some(name) = arg
+            .strip_prefix("--sort=")
+            .or_else(|| arg.strip_prefix("-S="))
+        {
+            opts.sort = Sort::parse(name).ok_or(format!("unknown sort: {name}"))?;
             continue;
         }
         if let Some(q) = arg
@@ -108,6 +124,7 @@ fn parse_args() -> Result<Option<Opts>, String> {
             "-p" | "--pick" => opts.pick = true,
             "-c" | "--cd" => opts.cd = true,
             "-q" | "--query" => want_query = true,
+            "-S" | "--sort" => want_sort = true,
             "-s" | "--status" => opts.status = true,
             "--no-pr" | "--no-prs" => opts.prs = false,
             other if other.starts_with('-') && other != "-" => {
@@ -124,6 +141,9 @@ fn parse_args() -> Result<Option<Opts>, String> {
     }
     if want_query {
         return Err("--query needs a value".to_string());
+    }
+    if want_sort {
+        return Err("--sort needs one of: name, recent, oldest".to_string());
     }
     Ok(Some(opts))
 }
@@ -160,6 +180,7 @@ fn main() -> ExitCode {
         && env::var("TERM").as_deref() != Ok("dumb");
 
     let mut app = App::new(repos, dir, opts.prs, color);
+    app.sort = opts.sort;
     let (mut loader, rx) = Loader::new(8);
     if opts.prs {
         for (i, repo) in app.repos.iter().enumerate() {
@@ -189,9 +210,18 @@ fn main() -> ExitCode {
     let mut outstanding = if opts.prs { app.repos.len() } else { 0 };
     if opts.status {
         for wt in &app.worktrees {
-            loader.request_status(&wt.path);
+            if loader.request_status(&wt.path) {
+                outstanding += 1;
+            }
         }
-        outstanding += loader.pending();
+    } else if opts.sort != Sort::Name {
+        // Ordering by age needs every row dated; the cheap pass is enough, and
+        // avoids a full status scan per worktree.
+        for wt in &app.worktrees {
+            if loader.request_age(&wt.path) {
+                outstanding += 1;
+            }
+        }
     }
     let deadline = Instant::now() + Duration::from_secs(120);
     while outstanding > 0 {

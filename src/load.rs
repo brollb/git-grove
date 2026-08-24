@@ -13,15 +13,23 @@ use crate::git::{self, Status};
 
 pub enum Msg {
     Status(PathBuf, Status),
+    /// The cheap age estimate for a worktree.
+    Age(PathBuf, Option<u64>),
     /// PRs for the repo at this index, or the reason they are unavailable.
     Prs(usize, Result<HashMap<String, Pr>, String>),
 }
 
-type Queue = Arc<(Mutex<Vec<PathBuf>>, Condvar)>;
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Status,
+    Age,
+}
+
+type Queue = Arc<(Mutex<Vec<(Kind, PathBuf)>>, Condvar)>;
 
 pub struct Loader {
     queue: Queue,
-    requested: HashSet<PathBuf>,
+    requested: HashSet<(bool, PathBuf)>,
     tx: Sender<Msg>,
 }
 
@@ -46,24 +54,36 @@ impl Loader {
         )
     }
 
-    /// Queue a status lookup, unless one was already requested for this path.
-    pub fn request_status(&mut self, path: &Path) {
-        if !self.requested.insert(path.to_path_buf()) {
-            return;
+    /// Queue a full status lookup. Returns whether it was newly queued, so
+    /// callers can count the replies they are waiting for.
+    pub fn request_status(&mut self, path: &Path) -> bool {
+        self.request(Kind::Status, path)
+    }
+
+    /// Queue a cheap age lookup.
+    pub fn request_age(&mut self, path: &Path) -> bool {
+        self.request(Kind::Age, path)
+    }
+
+    fn request(&mut self, kind: Kind, path: &Path) -> bool {
+        if !self
+            .requested
+            .insert((kind == Kind::Status, path.to_path_buf()))
+        {
+            return false;
         }
         let (lock, cv) = &*self.queue;
-        lock.lock().unwrap().push(path.to_path_buf());
+        // LIFO: the picker asks for the rows on screen last, so they run first.
+        lock.lock().unwrap().push((kind, path.to_path_buf()));
         cv.notify_one();
+        true
     }
 
-    /// Drop the memo for `path` so its status is recomputed on next request —
-    /// used after returning from a shell that may have changed the worktree.
+    /// Drop the memos for `path` so it is recomputed on next request — used
+    /// after returning from a shell that may have changed the worktree.
     pub fn forget(&mut self, path: &Path) {
-        self.requested.remove(path);
-    }
-
-    pub fn pending(&self) -> usize {
-        self.requested.len()
+        self.requested.remove(&(true, path.to_path_buf()));
+        self.requested.remove(&(false, path.to_path_buf()));
     }
 
     pub fn spawn_prs(&self, repo: usize, dir: PathBuf) {
@@ -76,7 +96,7 @@ impl Loader {
 
 fn worker(queue: Queue, tx: Sender<Msg>) {
     loop {
-        let path = {
+        let (kind, path) = {
             let (lock, cv) = &*queue;
             let mut pending = lock.lock().unwrap();
             loop {
@@ -86,10 +106,11 @@ fn worker(queue: Queue, tx: Sender<Msg>) {
                 }
             }
         };
-        if tx
-            .send(Msg::Status(path.clone(), git::status(&path)))
-            .is_err()
-        {
+        let msg = match kind {
+            Kind::Status => Msg::Status(path.clone(), git::status(&path)),
+            Kind::Age => Msg::Age(path.clone(), git::age(&path)),
+        };
+        if tx.send(msg).is_err() {
             return; // receiver gone: we are shutting down
         }
     }

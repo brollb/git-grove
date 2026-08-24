@@ -52,10 +52,28 @@ finds a worktree by its PR number.
 | *any character* | extend the filter |
 | `↑` `↓`, `ctrl-p` `ctrl-n`, `PgUp` `PgDn`, `Home` `End` | move |
 | `enter` | select |
+| `ctrl-s` | cycle the sort: by name → newest first → oldest first |
 | `ctrl-o` | open the PR in a browser |
 | `backspace`, `ctrl-w`, `ctrl-u` | delete a character, a word, the query |
 | `esc` | clear the query, or quit when it is already empty |
 | `ctrl-c`, `ctrl-d` | quit |
+
+### Sorting
+
+`ctrl-s` cycles the order between by name (repo order, main worktree first),
+newest first, and oldest first — the last being the one to reach for when
+deciding what to prune. `--sort recent|oldest|name` sets it from the command
+line, for the picker and for `--plain`/`--json` alike.
+
+An age sort outranks match score, so it keeps applying while you filter.
+Changing the sort moves the cursor to the top of the new order, since that is
+the row you asked to see; a list that re-orders on its own as ages arrive keeps
+your cursor on the worktree it was already on.
+
+Sorting by age needs every row dated, which the cheap age pass does in well
+under a second even for a few hundred worktrees. Rows that have not come back
+yet sit at the end rather than jumping around, and the header counts them off
+while they land.
 
 ### Jumping to a worktree
 
@@ -87,6 +105,7 @@ Cancelling exits 130 with nothing on stdout, so `cd` is left alone.
 | --- | --- |
 | `-c`, `--cd` | open a shell in the selected worktree, then return to the picker |
 | `-q`, `--query Q` | start with the filter pre-filled; also filters `--plain`/`--json` |
+| `-S`, `--sort S` | order by `name` (default), `recent`, or `oldest` |
 | `-p`, `--pick` | force the picker, printing the selection to stdout |
 | `--plain` | force tab-separated output: `path`, `branch`, `head`, `pr`, `flags` |
 | `-j`, `--json` | JSON output |
@@ -120,8 +139,12 @@ usage, `130` picker cancelled.
 - Branch names are matched against PR head branches allowing for the Claude Code
   worktree convention: `worktree-brollb+fix` is pushed as `brollb/fix`.
 - In the picker, `git status` is only run for the rows on screen, so a
-  248-worktree directory draws immediately and fills in as you scroll. The age
-  comes from the same pass, so both columns fill in together.
+  248-worktree directory draws immediately and fills in as you scroll.
+- Ages come from a second, much cheaper pass — a `git log -1` and a stat, no
+  status scan — because sorting needs every row dated at once. Across the 187
+  worktrees of a large monorepo that is ~0.9s, where a full status sweep is
+  ~24s. The age shown starts as that estimate and is refined upward when the
+  full status for a row arrives, which is what notices uncommitted edits.
 - `--plain` reports the age as `mtime=<unix seconds>` among the flags, and
   `--json` as `status.last_modified`; `status.modified` next to it is the count
   of modified files, not a time.
