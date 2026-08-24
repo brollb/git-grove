@@ -56,6 +56,12 @@ impl Loader {
         cv.notify_one();
     }
 
+    /// Drop the memo for `path` so its status is recomputed on next request —
+    /// used after returning from a shell that may have changed the worktree.
+    pub fn forget(&mut self, path: &Path) {
+        self.requested.remove(path);
+    }
+
     pub fn pending(&self) -> usize {
         self.requested.len()
     }

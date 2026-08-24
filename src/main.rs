@@ -4,6 +4,7 @@
 //! lines (or JSON with `--json`).
 
 mod app;
+mod fuzzy;
 mod gh;
 mod git;
 mod load;
@@ -12,7 +13,7 @@ mod ui;
 use std::env;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
 use app::{display_path, App, PrCell};
@@ -27,10 +28,15 @@ USAGE:
 DIRECTORY defaults to the current directory. If it is inside a git repo, that
 repo's worktrees are listed; otherwise every repo directly beneath it is scanned.
 
-Interactive by default on a TTY: arrows/j/k move, enter prints the selected
-worktree path, o opens its PR, q quits.
+Interactive by default on a TTY: type to fuzzy-filter, arrows to move, enter
+prints the selected worktree path, ctrl-o opens its PR, esc clears the filter
+or quits.
 
 OPTIONS:
+    -c, --cd        open a shell in the worktree you select, and return to the
+                    picker when that shell exits (ctrl-d)
+    -q, --query Q   start with the filter box pre-filled; filters --plain and
+                    --json output too
     -p, --pick      force the interactive picker, printing the selection to
                     stdout even when stdout is redirected
                         cd \"$(git-worktrees --pick)\"
@@ -55,8 +61,10 @@ struct Opts {
     json: bool,
     plain: bool,
     pick: bool,
+    cd: bool,
     prs: bool,
     status: bool,
+    query: String,
 }
 
 fn parse_args() -> Result<Option<Opts>, String> {
@@ -65,12 +73,27 @@ fn parse_args() -> Result<Option<Opts>, String> {
         json: false,
         plain: false,
         pick: false,
+        cd: false,
         prs: true,
         status: false,
+        query: String::new(),
     };
     let mut dir_set = false;
+    let mut want_query = false;
 
     for arg in env::args().skip(1) {
+        if want_query {
+            opts.query = arg;
+            want_query = false;
+            continue;
+        }
+        if let Some(q) = arg
+            .strip_prefix("--query=")
+            .or_else(|| arg.strip_prefix("-q="))
+        {
+            opts.query = q.to_string();
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -83,6 +106,8 @@ fn parse_args() -> Result<Option<Opts>, String> {
             "-j" | "--json" => opts.json = true,
             "--plain" => opts.plain = true,
             "-p" | "--pick" => opts.pick = true,
+            "-c" | "--cd" => opts.cd = true,
+            "-q" | "--query" => want_query = true,
             "-s" | "--status" => opts.status = true,
             "--no-pr" | "--no-prs" => opts.prs = false,
             other if other.starts_with('-') && other != "-" => {
@@ -96,6 +121,9 @@ fn parse_args() -> Result<Option<Opts>, String> {
                 dir_set = true;
             }
         }
+    }
+    if want_query {
+        return Err("--query needs a value".to_string());
     }
     Ok(Some(opts))
 }
@@ -124,8 +152,9 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let interactive = (opts.pick || (std::io::stdout().is_terminal() && !opts.plain && !opts.json))
-        && ui::tty_available();
+    let interactive =
+        (opts.pick || opts.cd || (std::io::stdout().is_terminal() && !opts.plain && !opts.json))
+            && ui::tty_available();
     let color = interactive
         && env::var_os("NO_COLOR").is_none()
         && env::var("TERM").as_deref() != Ok("dumb");
@@ -139,7 +168,11 @@ fn main() -> ExitCode {
     }
 
     if interactive {
-        return match ui::run(&mut app, &mut loader, &rx) {
+        let mut state = ui::PickerState::with_query(opts.query.clone());
+        if opts.cd {
+            return shell_loop(&mut app, &mut loader, &rx, &mut state);
+        }
+        return match ui::run(&mut app, &mut loader, &rx, &mut state) {
             Ok(Some(path)) => {
                 println!("{}", path.display());
                 ExitCode::SUCCESS
@@ -179,18 +212,51 @@ fn main() -> ExitCode {
         }
     }
 
+    let selection: Vec<usize> = app
+        .filter(&opts.query)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect();
     if opts.json {
-        print_json(&app, opts.status);
+        print_json(&app, &selection, opts.status);
     } else {
-        print_plain(&app, opts.status);
+        print_plain(&app, &selection, opts.status);
     }
     ExitCode::SUCCESS
 }
 
-fn print_plain(app: &App, with_status: bool) {
+/// `--cd`: hand the selected worktree to a shell, and come back to the picker
+/// when that shell exits, until the user quits the picker itself.
+fn shell_loop(
+    app: &mut App,
+    loader: &mut load::Loader,
+    rx: &std::sync::mpsc::Receiver<load::Msg>,
+    state: &mut ui::PickerState,
+) -> ExitCode {
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    loop {
+        let path = match ui::run(app, loader, rx, state) {
+            Ok(Some(path)) => path,
+            Ok(None) => return ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("git-worktrees: {err}");
+                return ExitCode::from(1);
+            }
+        };
+        eprintln!("\x1b[90m\u{2192} {}\x1b[0m", path.display());
+        if let Err(err) = Command::new(&shell).current_dir(&path).status() {
+            eprintln!("git-worktrees: {shell} in {}: {err}", path.display());
+        }
+        // Whatever happened in there, the worktree's status is now suspect.
+        app.statuses.remove(&path);
+        loader.forget(&path);
+    }
+}
+
+fn print_plain(app: &App, selection: &[usize], with_status: bool) {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    for wt in &app.worktrees {
+    for wt in selection.iter().map(|&i| &app.worktrees[i]) {
         let pr = match app.pr_for(wt) {
             PrCell::Open(pr) => format!("#{}", pr.number),
             _ => "-".to_string(),
@@ -251,10 +317,10 @@ fn print_plain(app: &App, with_status: bool) {
     }
 }
 
-fn print_json(app: &App, with_status: bool) {
-    let items: Vec<serde_json::Value> = app
-        .worktrees
+fn print_json(app: &App, selection: &[usize], with_status: bool) {
+    let items: Vec<serde_json::Value> = selection
         .iter()
+        .map(|&i| &app.worktrees[i])
         .map(|wt| {
             let mut obj = serde_json::json!({
                 "repo": app.repos[wt.repo].label,

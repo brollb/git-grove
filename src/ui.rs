@@ -10,6 +10,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
 
 use crate::app::{App, PrCell};
+use crate::fuzzy::Hits;
 use crate::gh;
 use crate::git::Status;
 use crate::load::{Loader, Msg};
@@ -21,10 +22,30 @@ const YELLOW: &str = "33";
 const RED: &str = "31";
 const DIM: &str = "90";
 const BOLD: &str = "1";
+/// Matched characters of the query.
+const HL: &str = "1;36";
 
 enum Row {
     Header(String),
-    Item(usize),
+    Item(usize, Hits),
+}
+
+/// Query and cursor, kept across picker visits so that returning from a
+/// worktree shell (`--cd`) lands you back where you were.
+#[derive(Default)]
+pub struct PickerState {
+    pub query: String,
+    sel: usize,
+    off: usize,
+}
+
+impl PickerState {
+    pub fn with_query(query: String) -> PickerState {
+        PickerState {
+            query,
+            ..Default::default()
+        }
+    }
 }
 
 /// Restores the terminal however we leave the picker — including on panic.
@@ -43,9 +64,13 @@ impl Drop for Restore {
     }
 }
 
-pub fn run(app: &mut App, loader: &mut Loader, rx: &Receiver<Msg>) -> io::Result<Option<PathBuf>> {
-    let rows = build_rows(app);
-    if !rows.iter().any(|r| matches!(r, Row::Item(_))) {
+pub fn run(
+    app: &mut App,
+    loader: &mut Loader,
+    rx: &Receiver<Msg>,
+    state: &mut PickerState,
+) -> io::Result<Option<PathBuf>> {
+    if app.worktrees.is_empty() {
         return Ok(None);
     }
 
@@ -57,13 +82,18 @@ pub fn run(app: &mut App, loader: &mut Loader, rx: &Receiver<Msg>) -> io::Result
     terminal::enable_raw_mode()?;
     execute!(tty, terminal::EnterAlternateScreen, crossterm::cursor::Hide)?;
 
-    let mut sel = first_item(&rows);
-    let mut off = 0usize;
+    let mut rows = build_rows(app, &state.query);
+    let mut sel = state.sel.min(rows.len().saturating_sub(1));
+    if !matches!(rows.get(sel), Some(Row::Item(..))) {
+        sel = first_item(&rows);
+    }
+    let mut off = state.off;
     let mut dirty = true;
+    let selected;
 
     loop {
         let (width, height) = size();
-        let view = height.saturating_sub(6).max(1); // title + 2 header lines + 3 footer
+        let view = height.saturating_sub(6).max(1); // title + prompt + header + 3 footer
 
         if sel < off {
             off = sel;
@@ -74,7 +104,7 @@ pub fn run(app: &mut App, loader: &mut Loader, rx: &Receiver<Msg>) -> io::Result
 
         // Only the rows on screen pay for a `git status`.
         for row in rows.iter().skip(off).take(view) {
-            if let Row::Item(i) = row {
+            if let Row::Item(i, _) = row {
                 let path = &app.worktrees[*i].path;
                 if !app.statuses.contains_key(path) {
                     loader.request_status(path);
@@ -83,7 +113,7 @@ pub fn run(app: &mut App, loader: &mut Loader, rx: &Receiver<Msg>) -> io::Result
         }
 
         if dirty {
-            draw(&mut tty, app, &rows, sel, off, view, width)?;
+            draw(&mut tty, app, &rows, &state.query, sel, off, view, width)?;
             dirty = false;
         }
 
@@ -91,30 +121,67 @@ pub fn run(app: &mut App, loader: &mut Loader, rx: &Receiver<Msg>) -> io::Result
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let alt = key.modifiers.contains(KeyModifiers::ALT);
+                    let mut requery = false;
                     match key.code {
-                        KeyCode::Char('c') if ctrl => return Ok(None),
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                        KeyCode::Char('c' | 'd') if ctrl => {
+                            selected = None;
+                            break;
+                        }
+                        KeyCode::Esc => {
+                            if state.query.is_empty() {
+                                selected = None;
+                                break;
+                            }
+                            state.query.clear();
+                            requery = true;
+                        }
                         KeyCode::Enter => {
-                            if let Row::Item(i) = rows[sel] {
-                                return Ok(Some(app.worktrees[i].path.clone()));
+                            if let Some(Row::Item(i, _)) = rows.get(sel) {
+                                selected = Some(app.worktrees[*i].path.clone());
+                                break;
                             }
                         }
-                        KeyCode::Up | KeyCode::Char('k') => sel = step(&rows, sel, -1),
-                        KeyCode::Down | KeyCode::Char('j') => sel = step(&rows, sel, 1),
-                        KeyCode::Char('p') if ctrl => sel = step(&rows, sel, -1),
-                        KeyCode::Char('n') if ctrl => sel = step(&rows, sel, 1),
-                        KeyCode::PageUp => sel = jump(&rows, sel, -(view as isize)),
-                        KeyCode::PageDown => sel = jump(&rows, sel, view as isize),
-                        KeyCode::Home | KeyCode::Char('g') => sel = first_item(&rows),
-                        KeyCode::End | KeyCode::Char('G') => sel = last_item(&rows),
-                        KeyCode::Char('o') => {
-                            if let Row::Item(i) = rows[sel] {
-                                if let PrCell::Open(pr) = app.pr_for(&app.worktrees[i]) {
+                        KeyCode::Char('u') if ctrl => {
+                            state.query.clear();
+                            requery = true;
+                        }
+                        KeyCode::Char('w') if ctrl => {
+                            let trimmed = state.query.trim_end();
+                            let cut = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
+                            state.query.truncate(cut);
+                            requery = true;
+                        }
+                        KeyCode::Backspace => {
+                            state.query.pop();
+                            requery = true;
+                        }
+                        KeyCode::Char('o') if ctrl => {
+                            if let Some(Row::Item(i, _)) = rows.get(sel) {
+                                if let PrCell::Open(pr) = app.pr_for(&app.worktrees[*i]) {
                                     gh::open_url(&pr.url);
                                 }
                             }
                         }
+                        KeyCode::Up => sel = step(&rows, sel, -1),
+                        KeyCode::Down => sel = step(&rows, sel, 1),
+                        KeyCode::Char('p') if ctrl => sel = step(&rows, sel, -1),
+                        KeyCode::Char('n') if ctrl => sel = step(&rows, sel, 1),
+                        KeyCode::PageUp => sel = jump(&rows, sel, -(view as isize)),
+                        KeyCode::PageDown => sel = jump(&rows, sel, view as isize),
+                        KeyCode::Home => sel = first_item(&rows),
+                        KeyCode::End => sel = last_item(&rows),
+                        // Anything else printable extends the query.
+                        KeyCode::Char(c) if !ctrl && !alt => {
+                            state.query.push(c);
+                            requery = true;
+                        }
                         _ => {}
+                    }
+                    if requery {
+                        rows = build_rows(app, &state.query);
+                        sel = first_item(&rows);
+                        off = 0;
                     }
                     dirty = true;
                 }
@@ -123,36 +190,62 @@ pub fn run(app: &mut App, loader: &mut Loader, rx: &Receiver<Msg>) -> io::Result
             }
         }
 
+        let mut prs_arrived = false;
         while let Ok(msg) = rx.try_recv() {
+            prs_arrived |= matches!(msg, Msg::Prs(..));
             app.apply(msg);
             dirty = true;
         }
+        // PR numbers are searchable, so late-arriving PRs can change the match set.
+        if prs_arrived && !state.query.trim().is_empty() {
+            rows = build_rows(app, &state.query);
+            sel = sel.min(rows.len().saturating_sub(1));
+            if !matches!(rows.get(sel), Some(Row::Item(..))) {
+                sel = first_item(&rows);
+            }
+        }
     }
+
+    state.sel = sel;
+    state.off = off;
+    Ok(selected)
 }
 
-fn build_rows(app: &App) -> Vec<Row> {
+fn build_rows(app: &App, query: &str) -> Vec<Row> {
+    let matches = app.filter(query);
+
+    // Filtered results are ranked across repos, so repo headers would be
+    // meaningless; the path column carries the repo name in that case anyway.
+    if !query.trim().is_empty() {
+        return matches
+            .into_iter()
+            .map(|(i, hits)| Row::Item(i, hits))
+            .collect();
+    }
+
     let mut rows = Vec::new();
     let multi = app.repos.len() > 1;
     let mut last_repo = usize::MAX;
-    for (i, wt) in app.worktrees.iter().enumerate() {
+    for (i, hits) in matches {
+        let wt = &app.worktrees[i];
         if multi && wt.repo != last_repo {
             rows.push(Row::Header(app.repos[wt.repo].label.clone()));
             last_repo = wt.repo;
         }
-        rows.push(Row::Item(i));
+        rows.push(Row::Item(i, hits));
     }
     rows
 }
 
 fn first_item(rows: &[Row]) -> usize {
     rows.iter()
-        .position(|r| matches!(r, Row::Item(_)))
+        .position(|r| matches!(r, Row::Item(..)))
         .unwrap_or(0)
 }
 
 fn last_item(rows: &[Row]) -> usize {
     rows.iter()
-        .rposition(|r| matches!(r, Row::Item(_)))
+        .rposition(|r| matches!(r, Row::Item(..)))
         .unwrap_or(0)
 }
 
@@ -164,7 +257,7 @@ fn step(rows: &[Row], from: usize, dir: isize) -> usize {
         if i < 0 || i as usize >= rows.len() {
             return from;
         }
-        if matches!(rows[i as usize], Row::Item(_)) {
+        if matches!(rows[i as usize], Row::Item(..)) {
             return i as usize;
         }
     }
@@ -172,16 +265,18 @@ fn step(rows: &[Row], from: usize, dir: isize) -> usize {
 
 /// Move roughly `n` rows, then settle on the nearest selectable row.
 fn jump(rows: &[Row], from: usize, n: isize) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
     let target = (from as isize + n).clamp(0, rows.len() as isize - 1) as usize;
-    if matches!(rows[target], Row::Item(_)) {
+    if matches!(rows[target], Row::Item(..)) {
         return target;
     }
-    let back = if n < 0 { 1 } else { -1 };
     let settled = step(rows, target, if n < 0 { -1 } else { 1 });
-    if matches!(rows[settled], Row::Item(_)) && settled != target {
+    if matches!(rows[settled], Row::Item(..)) && settled != target {
         settled
     } else {
-        step(rows, target, back)
+        step(rows, target, if n < 0 { 1 } else { -1 })
     }
 }
 
@@ -220,10 +315,12 @@ fn widths(app: &App, total: usize) -> Widths {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     tty: &mut File,
     app: &App,
     rows: &[Row],
+    query: &str,
     sel: usize,
     off: usize,
     view: usize,
@@ -252,7 +349,7 @@ fn draw(
         },
     );
     line(&mut buf, &paint(BOLD, &fit(&title, width), color));
-    line(&mut buf, "");
+    line(&mut buf, &prompt_line(query, rows, total, width, color));
     line(
         &mut buf,
         &paint(
@@ -271,7 +368,9 @@ fn draw(
         ),
     );
 
+    let mut drawn = 0;
     for (idx, row) in rows.iter().enumerate().skip(off).take(view) {
+        drawn += 1;
         match row {
             Row::Header(label) => {
                 line(
@@ -279,54 +378,73 @@ fn draw(
                     &paint(BOLD, &fit(&format!(" {label}"), width), color),
                 );
             }
-            Row::Item(i) => {
+            Row::Item(i, hits) => {
                 let wt = &app.worktrees[*i];
                 let selected = idx == sel;
                 let pr_cell = fit(&pr_text(app.pr_for(wt)), w.pr);
-                let branch_cell = fit(&wt.branch_label(), w.branch);
                 let status_cell = fit(
                     &status_text(app.statuses.get(&wt.path), wt.locked, wt.prunable),
                     w.status,
                 );
-                let path_cell =
-                    fit_tail(&crate::app::display_path(&wt.path, Some(&app.root)), w.path);
+                let branch = wt.branch_label();
+                let path = crate::app::display_path(&wt.path, Some(&app.root));
                 let marker = if selected { "\u{25b8} " } else { "  " };
-                let plain = fit(
-                    &format!("{marker}{pr_cell}  {branch_cell}  {status_cell}  {path_cell}"),
-                    width,
-                );
+
                 if selected {
-                    // Reverse video over the whole row, so per-cell colors
-                    // (and their resets) can't punch holes in the highlight.
+                    // Reverse video over the whole row, so per-cell colors (and
+                    // their resets) can't punch holes in the highlight.
+                    let plain = fit(
+                        &format!(
+                            "{marker}{pr_cell}  {}  {status_cell}  {}",
+                            fit(&branch, w.branch),
+                            fit_tail(&path, w.path)
+                        ),
+                        width,
+                    );
                     line(&mut buf, &paint("7", &plain, color));
                 } else if color {
                     let styled = format!(
                         "{marker}{}  {}  {}  {}",
                         paint(pr_color(app.pr_for(wt)), &pr_cell, true),
-                        branch_cell,
+                        fit_hl(&branch, w.branch, &hits.branch, false, ""),
                         paint(
                             status_color(app.statuses.get(&wt.path), wt.prunable),
                             &status_cell,
                             true
                         ),
-                        paint(DIM, &path_cell, true),
+                        fit_hl(&path, w.path, &hits.path, true, DIM),
                     );
                     line(&mut buf, &styled);
                 } else {
+                    let plain = fit(
+                        &format!(
+                            "{marker}{pr_cell}  {}  {status_cell}  {}",
+                            fit(&branch, w.branch),
+                            fit_tail(&path, w.path)
+                        ),
+                        width,
+                    );
                     line(&mut buf, &plain);
                 }
             }
         }
     }
 
-    // Pad out to the footer.
-    for _ in (off + view).min(rows.len())..(off + view) {
+    if drawn == 0 {
+        line(&mut buf, "");
+        line(
+            &mut buf,
+            &paint(DIM, &fit("  no worktree matches that query", width), color),
+        );
+        drawn = 2;
+    }
+    for _ in drawn..view {
         line(&mut buf, "");
     }
 
     line(&mut buf, "");
     let detail = match rows.get(sel) {
-        Some(Row::Item(i)) => detail_text(app, *i),
+        Some(Row::Item(i, _)) => detail_text(app, *i),
         _ => String::new(),
     };
     line(&mut buf, &fit(&detail, width));
@@ -335,7 +453,7 @@ fn draw(
         &paint(
             DIM,
             &fit(
-                "  \u{2191}/\u{2193} move  ·  enter: print path  ·  o: open PR  ·  q: quit",
+                "  type to filter  ·  \u{2191}/\u{2193} move  ·  enter: select  ·  ctrl-o: open PR  ·  esc: clear/quit",
                 width,
             ),
             color,
@@ -345,6 +463,24 @@ fn draw(
     buf.push_str("\x1b[J"); // clear anything below
     tty.write_all(buf.as_bytes())?;
     tty.flush()
+}
+
+fn prompt_line(query: &str, rows: &[Row], total: usize, width: usize, color: bool) -> String {
+    let shown = rows.iter().filter(|r| matches!(r, Row::Item(..))).count();
+    let counts = format!("{shown}/{total} ");
+    let left = if query.is_empty() {
+        format!(" \u{203a} {}", paint(DIM, "type to filter", color))
+    } else {
+        format!(" \u{203a} {query}\u{258c}")
+    };
+    // `left` may carry escape codes, so pad against its printable width.
+    let printable = if query.is_empty() {
+        3 + "type to filter".chars().count()
+    } else {
+        3 + query.chars().count() + 1
+    };
+    let gap = width.saturating_sub(printable + counts.chars().count());
+    format!("{left}{}{}", " ".repeat(gap), paint(DIM, &counts, color))
 }
 
 fn line(buf: &mut String, s: &str) {
@@ -469,6 +605,61 @@ fn fit_tail(s: &str, w: usize) -> String {
     out
 }
 
+/// `fit`/`fit_tail` with the query's matched characters highlighted, over a
+/// `base` style that is restored after each highlighted run.
+fn fit_hl(s: &str, w: usize, hits: &[usize], tail: bool, base: &str) -> String {
+    if hits.is_empty() {
+        let fitted = if tail { fit_tail(s, w) } else { fit(s, w) };
+        return paint(base, &fitted, !base.is_empty());
+    }
+    if w == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    // Mirror the window fit/fit_tail would have shown, so hit offsets line up.
+    let (start, end, prefix, suffix) = if n <= w {
+        (0, n, "", "")
+    } else if tail {
+        (n - (w - 1), n, "\u{2026}", "")
+    } else {
+        (0, w - 1, "", "\u{2026}")
+    };
+
+    let restore = if base.is_empty() {
+        RESET.to_string()
+    } else {
+        format!("\x1b[{base}m")
+    };
+    let mut out = String::new();
+    if !base.is_empty() {
+        out.push_str(&restore);
+    }
+    out.push_str(prefix);
+    let mut lit = false;
+    for (i, ch) in chars.iter().enumerate().take(end).skip(start) {
+        let hit = hits.binary_search(&i).is_ok();
+        if hit && !lit {
+            out.push_str(&format!("\x1b[{HL}m"));
+            lit = true;
+        } else if !hit && lit {
+            out.push_str(&restore);
+            lit = false;
+        }
+        out.push(*ch);
+    }
+    if lit || !base.is_empty() {
+        out.push_str(RESET);
+    }
+    out.push_str(suffix);
+
+    let shown = (end - start) + prefix.chars().count() + suffix.chars().count();
+    if shown < w {
+        out.push_str(&" ".repeat(w - shown));
+    }
+    out
+}
+
 pub fn tty_available() -> bool {
     Path::new("/dev/tty").exists() && File::open("/dev/tty").is_ok()
 }
@@ -476,6 +667,24 @@ pub fn tty_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Strip SGR escapes, leaving what the terminal actually shows.
+    fn visible(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
 
     #[test]
     fn fit_pads_and_truncates_to_exact_width() {
@@ -495,20 +704,42 @@ mod tests {
     }
 
     #[test]
+    fn highlighting_does_not_change_the_visible_text() {
+        for (s, w, hits, tail) in [
+            ("brollb/loops", 20, vec![7, 8, 9, 10, 11], false),
+            ("brollb/loops", 6, vec![0, 1], false),
+            ("/a/very/long/path", 8, vec![13, 14, 15, 16], true),
+            ("exact", 5, vec![0, 4], false),
+        ] {
+            let hl = fit_hl(s, w, &hits, tail, DIM);
+            let plain = if tail { fit_tail(s, w) } else { fit(s, w) };
+            assert_eq!(visible(&hl), plain, "{s:?} at width {w}");
+            assert_eq!(visible(&hl).chars().count(), w);
+        }
+    }
+
+    #[test]
+    fn highlighting_wraps_only_the_matched_run() {
+        let out = fit_hl("abcd", 4, &[1, 2], false, "");
+        assert!(out.contains(&format!("\x1b[{HL}mbc")), "got {out:?}");
+        assert_eq!(visible(&out), "abcd");
+    }
+
+    #[test]
     fn navigation_skips_repo_headers() {
         let rows = vec![
             Row::Header("a".into()),
-            Row::Item(0),
+            Row::Item(0, Hits::default()),
             Row::Header("b".into()),
-            Row::Item(1),
+            Row::Item(1, Hits::default()),
         ];
         assert_eq!(first_item(&rows), 1);
         assert_eq!(last_item(&rows), 3);
         assert_eq!(step(&rows, 1, 1), 3, "header between items is skipped");
         assert_eq!(step(&rows, 3, 1), 3, "stays put at the end");
         assert_eq!(step(&rows, 1, -1), 1, "stays put at the start");
-        assert!(matches!(rows[jump(&rows, 1, 10)], Row::Item(_)));
-        assert!(matches!(rows[jump(&rows, 3, -10)], Row::Item(_)));
+        assert!(matches!(rows[jump(&rows, 1, 10)], Row::Item(..)));
+        assert!(matches!(rows[jump(&rows, 3, -10)], Row::Item(..)));
     }
 
     #[test]
@@ -535,5 +766,14 @@ mod tests {
             ),
             "missing"
         );
+    }
+
+    #[test]
+    fn prompt_line_is_exactly_one_row_wide() {
+        let rows = vec![Row::Item(0, Hits::default())];
+        for query in ["", "loops", "a b"] {
+            let out = prompt_line(query, &rows, 42, 60, true);
+            assert_eq!(visible(&out).chars().count(), 60, "query {query:?}");
+        }
     }
 }

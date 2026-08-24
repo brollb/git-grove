@@ -3,21 +3,19 @@
 List the git worktrees in a directory, annotated with the number of the open
 GitHub PR for each branch.
 
-On a TTY it opens an interactive picker; piped, it prints tab-separated lines,
-so the same command works in a terminal and in a script.
+On a TTY it opens an interactive picker with fuzzy search; piped, it prints
+tab-separated lines, so the same command works in a terminal and in a script.
 
 ```
  23 worktrees in ~/baseten/trainers  ·  8 with an open PR
-
+ › loops worker▌                                                          3/23
   PR       BRANCH                                    STATUS          PATH
-  #822     xiaohan/multilora-adapter-state           ●2 ?7           .
 ▸ #837     brollb/loops-worker                       ↑3              …/brollb+loops-worker
   #1003    brollb/loops-worker-drop-storage-dir      clean           …/loops-harness-fixes
   -        brollb/pickable-sampling-client           ↓12 ●1          …/brollb/pickable-sampling-client
-  #366     brollb/test-max-seq-len-error             prunable        /private/tmp/trainers-test-max-seq-len
 
   #837 (draft) feat(loops): real Megatron worker behind the broker
-  ↑/↓ move  ·  enter: print path  ·  o: open PR  ·  q: quit
+  type to filter  ·  ↑/↓ move  ·  enter: select  ·  ctrl-o: open PR  ·  esc: clear/quit
 ```
 
 ## Install
@@ -41,23 +39,54 @@ git worktrees --json | jq .    # machine-readable
 repo's worktrees are listed. Otherwise every repo directly beneath it is
 scanned, grouped by repo — handy for a `~/src`-style directory.
 
+### Searching
+
+Just type: the query fuzzy-matches the branch, path, PR number and (when more
+than one repo is listed) the repo name, best match first, with the matched
+characters highlighted. Space-separated tokens all have to match, so
+`trainers loops` narrows to loops branches in the trainers repo, and `837`
+finds a worktree by its PR number.
+
+| Key | |
+| --- | --- |
+| *any character* | extend the filter |
+| `↑` `↓`, `ctrl-p` `ctrl-n`, `PgUp` `PgDn`, `Home` `End` | move |
+| `enter` | select |
+| `ctrl-o` | open the PR in a browser |
+| `backspace`, `ctrl-w`, `ctrl-u` | delete a character, a word, the query |
+| `esc` | clear the query, or quit when it is already empty |
+| `ctrl-c`, `ctrl-d` | quit |
+
 ### Jumping to a worktree
 
-`enter` prints the selected worktree's absolute path to stdout, which is what
-makes this work:
+`--cd` opens a shell in the worktree you pick and returns you to the picker when
+that shell exits, so you can hop between worktrees without retyping paths:
+
+```sh
+alias cdw='git-worktrees --cd'
+```
+
+`ctrl-d` (or `exit`) leaves the worktree shell and puts the picker back up with
+your query and cursor where you left them; `esc` from there ends the session and
+returns you to the shell you started in, in the directory you started in. The
+worktree shell is a child process — it is `$SHELL` started with its working
+directory set — so nothing is changed in the calling shell.
+
+To change the calling shell's own directory instead, use `--pick`, which draws
+the list on `/dev/tty` and prints only the selection to stdout:
 
 ```sh
 wt() { cd "$(git-worktrees --pick "$@")" || return; }
 ```
 
-`--pick` forces the picker even when stdout is redirected: the list is drawn on
-`/dev/tty` and only the selection goes to stdout. Cancelling exits 130 with
-nothing on stdout, so `cd` is left alone.
+Cancelling exits 130 with nothing on stdout, so `cd` is left alone.
 
 ### Options
 
 | Option | Effect |
 | --- | --- |
+| `-c`, `--cd` | open a shell in the selected worktree, then return to the picker |
+| `-q`, `--query Q` | start with the filter pre-filled; also filters `--plain`/`--json` |
 | `-p`, `--pick` | force the picker, printing the selection to stdout |
 | `--plain` | force tab-separated output: `path`, `branch`, `head`, `pr`, `flags` |
 | `-j`, `--json` | JSON output |
