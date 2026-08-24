@@ -298,6 +298,9 @@ fn print_plain(app: &App, selection: &[usize], with_status: bool) {
                     if s.behind > 0 {
                         flags.push(format!("behind={}", s.behind));
                     }
+                    if let Some(touched) = s.touched {
+                        flags.push(format!("mtime={touched}"));
+                    }
                 }
             }
         }
@@ -352,6 +355,7 @@ fn print_json(app: &App, selection: &[usize], with_status: bool) {
                         "untracked": s.untracked,
                         "ahead": s.ahead,
                         "behind": s.behind,
+                        "last_modified": s.touched,
                     });
                 }
             }

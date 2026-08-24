@@ -9,12 +9,12 @@ tab-separated lines, so the same command works in a terminal and in a script.
 ```
  23 worktrees in ~/baseten/trainers  ·  8 with an open PR
  › loops worker▌                                                          3/23
-  PR       BRANCH                                    STATUS          PATH
-▸ #837     brollb/loops-worker                       ↑3              …/brollb+loops-worker
-  #1003    brollb/loops-worker-drop-storage-dir      clean           …/loops-harness-fixes
-  -        brollb/pickable-sampling-client           ↓12 ●1          …/brollb/pickable-sampling-client
+  PR       BRANCH                                    STATUS          AGE  PATH
+▸ #837     brollb/loops-worker                       ↑3                2h  …/brollb+loops-worker
+  #1003    brollb/loops-worker-drop-storage-dir      clean             3d  …/loops-harness-fixes
+  -        brollb/pickable-sampling-client           ↓12 ●1            5w  …/brollb/pickable-sampling-client
 
-  #837 (draft) feat(loops): real Megatron worker behind the broker
+  modified 2 hours ago  ·  #837 (draft) feat(loops): real Megatron worker behind the broker
   type to filter  ·  ↑/↓ move  ·  enter: select  ·  ctrl-o: open PR  ·  esc: clear/quit
 ```
 
@@ -90,7 +90,7 @@ Cancelling exits 130 with nothing on stdout, so `cd` is left alone.
 | `-p`, `--pick` | force the picker, printing the selection to stdout |
 | `--plain` | force tab-separated output: `path`, `branch`, `head`, `pr`, `flags` |
 | `-j`, `--json` | JSON output |
-| `-s`, `--status` | include working-tree status in `--plain`/`--json` output |
+| `-s`, `--status` | include working-tree status and last-modified time in `--plain`/`--json` output |
 | `--no-pr` | skip the GitHub lookup |
 
 Exit codes: `0` listed or selected, `1` nothing found or a fatal error, `2` bad
@@ -103,6 +103,11 @@ usage, `130` picker cancelled.
   selected row.
 - **STATUS** — `↑`/`↓` commits ahead of and behind upstream, `●` modified files,
   `?` untracked files, plus `locked`, `prunable` and `missing`.
+- **AGE** — how long ago the worktree was last touched: the newest of its HEAD
+  commit date, its own directory mtime, and the mtimes of the files git reports
+  as changed. So a clean worktree is dated by its last commit, and a dirty one
+  by the actual last edit. The selected row spells the age out in full under the
+  list.
 - **PATH** — relative to the directory you asked about. `.claude/worktrees/` is
   collapsed to `…/` since it is the same on nearly every row.
 
@@ -115,4 +120,10 @@ usage, `130` picker cancelled.
 - Branch names are matched against PR head branches allowing for the Claude Code
   worktree convention: `worktree-brollb+fix` is pushed as `brollb/fix`.
 - In the picker, `git status` is only run for the rows on screen, so a
-  248-worktree directory draws immediately and fills in as you scroll.
+  248-worktree directory draws immediately and fills in as you scroll. The age
+  comes from the same pass, so both columns fill in together.
+- `--plain` reports the age as `mtime=<unix seconds>` among the flags, and
+  `--json` as `status.last_modified`; `status.modified` next to it is the count
+  of modified files, not a time.
+- Status reads pass `--no-optional-locks`, so listing worktrees never refreshes
+  an index and never disturbs the timestamps it is reporting.

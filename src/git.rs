@@ -41,6 +41,11 @@ pub struct Status {
     pub behind: usize,
     /// The path is gone, or git refused to report on it.
     pub missing: bool,
+    /// Unix seconds of the last activity in this worktree: the newest of the
+    /// HEAD commit date, the worktree directory's own mtime, and the mtimes of
+    /// the files git reports as changed. A clean worktree therefore reports its
+    /// last commit; a dirty one reports the actual last edit.
+    pub touched: Option<u64>,
 }
 
 impl Status {
@@ -184,19 +189,60 @@ fn parse_porcelain(out: &str, repo: usize) -> Vec<Worktree> {
     worktrees
 }
 
+/// Files a `git status --porcelain` line refers to. `XY path`, or
+/// `XY orig -> new` for renames, with paths quoted if they need escaping.
+fn porcelain_path(line: &str) -> Option<&str> {
+    if line.len() < 4 {
+        return None;
+    }
+    let rest = &line[3..]; // the status letters and their separator are ASCII
+    let path = rest.rsplit(" -> ").next().unwrap_or(rest);
+    let path = path.trim().trim_matches('"');
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+fn mtime_secs(path: &Path) -> Option<u64> {
+    std::fs::symlink_metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Enough dirty files to date a worktree; stat'ing thousands would not make the
+/// answer any truer.
+const MAX_STATS: usize = 200;
+
 pub fn status(path: &Path) -> Status {
     let mut s = Status::default();
     if !path.exists() {
         s.missing = true;
         return s;
     }
-    match git(path, &["status", "--porcelain"]) {
+    // `--no-optional-locks` keeps our own read from refreshing the index, which
+    // would otherwise disturb the timestamps we are about to read.
+    match git(path, &["--no-optional-locks", "status", "--porcelain"]) {
         Some(out) => {
+            let mut stats = 0;
             for line in out.lines() {
                 if line.starts_with("??") {
                     s.untracked += 1;
                 } else if !line.trim().is_empty() {
                     s.modified += 1;
+                } else {
+                    continue;
+                }
+                if stats < MAX_STATS {
+                    if let Some(rel) = porcelain_path(line) {
+                        stats += 1;
+                        s.touched = s.touched.max(mtime_secs(&path.join(rel)));
+                    }
                 }
             }
         }
@@ -204,6 +250,11 @@ pub fn status(path: &Path) -> Status {
             s.missing = true;
             return s;
         }
+    }
+    s.touched = s.touched.max(mtime_secs(path));
+    // Fails on a repo with no commits yet, which is fine.
+    if let Some(out) = git(path, &["log", "-1", "--format=%ct"]) {
+        s.touched = s.touched.max(out.trim().parse::<u64>().ok());
     }
     // Fails (harmlessly) when the branch has no upstream.
     if let Some(out) = git(
@@ -287,6 +338,16 @@ prunable gitdir file points to non-existent location
         let wts = parse_porcelain(out, 0);
         assert!(wts[0].bare);
         assert_eq!(wts[0].branch_label(), "(bare)");
+    }
+
+    #[test]
+    fn reads_the_path_out_of_a_porcelain_line() {
+        assert_eq!(porcelain_path(" M src/main.rs"), Some("src/main.rs"));
+        assert_eq!(porcelain_path("?? notes.md"), Some("notes.md"));
+        assert_eq!(porcelain_path("R  old.rs -> new.rs"), Some("new.rs"));
+        assert_eq!(porcelain_path("A  \"odd name.rs\""), Some("odd name.rs"));
+        assert_eq!(porcelain_path(""), None);
+        assert_eq!(porcelain_path(" M "), None);
     }
 
     #[test]

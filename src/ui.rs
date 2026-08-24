@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
@@ -292,13 +292,15 @@ struct Widths {
     pr: usize,
     branch: usize,
     status: usize,
+    age: usize,
     path: usize,
 }
 
 fn widths(app: &App, total: usize) -> Widths {
     let pr = 7;
     let status = 14;
-    let fixed = 2 + pr + 2 + status + 2 + 2; // marker + gaps
+    let age = 5;
+    let fixed = 2 + pr + 2 + status + 2 + age + 2 + 2; // marker + gaps
     let flex = total.saturating_sub(fixed).max(20);
     let longest = app
         .worktrees
@@ -311,6 +313,7 @@ fn widths(app: &App, total: usize) -> Widths {
         pr,
         branch,
         status,
+        age,
         path: flex.saturating_sub(branch).max(8),
     }
 }
@@ -328,6 +331,7 @@ fn draw(
 ) -> io::Result<()> {
     let w = widths(app, width);
     let color = app.color;
+    let now = unix_now();
     let mut buf = String::new();
     buf.push_str("\x1b[H"); // home
 
@@ -356,10 +360,11 @@ fn draw(
             DIM,
             &fit(
                 &format!(
-                    "  {}  {}  {}  {}",
+                    "  {}  {}  {}  {}  {}",
                     fit("PR", w.pr),
                     fit("BRANCH", w.branch),
                     fit("STATUS", w.status),
+                    fit_right("AGE", w.age),
                     "PATH"
                 ),
                 width,
@@ -382,10 +387,9 @@ fn draw(
                 let wt = &app.worktrees[*i];
                 let selected = idx == sel;
                 let pr_cell = fit(&pr_text(app.pr_for(wt)), w.pr);
-                let status_cell = fit(
-                    &status_text(app.statuses.get(&wt.path), wt.locked, wt.prunable),
-                    w.status,
-                );
+                let status = app.statuses.get(&wt.path);
+                let status_cell = fit(&status_text(status, wt.locked, wt.prunable), w.status);
+                let age_cell = fit_right(&age_text(status, now), w.age);
                 let branch = wt.branch_label();
                 let path = crate::app::display_path(&wt.path, Some(&app.root));
                 let marker = if selected { "\u{25b8} " } else { "  " };
@@ -395,7 +399,7 @@ fn draw(
                     // their resets) can't punch holes in the highlight.
                     let plain = fit(
                         &format!(
-                            "{marker}{pr_cell}  {}  {status_cell}  {}",
+                            "{marker}{pr_cell}  {}  {status_cell}  {age_cell}  {}",
                             fit(&branch, w.branch),
                             fit_tail(&path, w.path)
                         ),
@@ -404,21 +408,18 @@ fn draw(
                     line(&mut buf, &paint("7", &plain, color));
                 } else if color {
                     let styled = format!(
-                        "{marker}{}  {}  {}  {}",
+                        "{marker}{}  {}  {}  {}  {}",
                         paint(pr_color(app.pr_for(wt)), &pr_cell, true),
                         fit_hl(&branch, w.branch, &hits.branch, false, ""),
-                        paint(
-                            status_color(app.statuses.get(&wt.path), wt.prunable),
-                            &status_cell,
-                            true
-                        ),
+                        paint(status_color(status, wt.prunable), &status_cell, true),
+                        paint(DIM, &age_cell, true),
                         fit_hl(&path, w.path, &hits.path, true, DIM),
                     );
                     line(&mut buf, &styled);
                 } else {
                     let plain = fit(
                         &format!(
-                            "{marker}{pr_cell}  {}  {status_cell}  {}",
+                            "{marker}{pr_cell}  {}  {status_cell}  {age_cell}  {}",
                             fit(&branch, w.branch),
                             fit_tail(&path, w.path)
                         ),
@@ -444,7 +445,7 @@ fn draw(
 
     line(&mut buf, "");
     let detail = match rows.get(sel) {
-        Some(Row::Item(i, _)) => detail_text(app, *i),
+        Some(Row::Item(i, _)) => detail_text(app, *i, now),
         _ => String::new(),
     };
     line(&mut buf, &fit(&detail, width));
@@ -489,20 +490,93 @@ fn line(buf: &mut String, s: &str) {
     buf.push_str("\r\n");
 }
 
-fn detail_text(app: &App, i: usize) -> String {
+fn detail_text(app: &App, i: usize, now: u64) -> String {
     let wt = &app.worktrees[i];
-    match app.pr_for(wt) {
+    let mut parts = Vec::new();
+    if let Some(touched) = app.statuses.get(&wt.path).and_then(|s| s.touched) {
+        parts.push(format!("modified {}", age_phrase(now, touched)));
+    }
+    parts.push(match app.pr_for(wt) {
         PrCell::Open(pr) => format!(
-            "  #{}{} {}",
+            "#{}{} {}",
             pr.number,
             if pr.draft { " (draft)" } else { "" },
             pr.title
         ),
-        PrCell::Loading => "  looking up pull requests\u{2026}".to_string(),
-        PrCell::Unavailable(why) => format!("  no PR data: {why}"),
-        PrCell::None if app.want_prs => "  no open PR for this branch".to_string(),
-        PrCell::None => format!("  {}", crate::git::short_sha(&wt.head)),
+        PrCell::Loading => "looking up pull requests\u{2026}".to_string(),
+        PrCell::Unavailable(why) => format!("no PR data: {why}"),
+        PrCell::None if app.want_prs => "no open PR for this branch".to_string(),
+        PrCell::None => crate::git::short_sha(&wt.head),
+    });
+    format!("  {}", parts.join("  \u{b7}  "))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn age_text(status: Option<&Status>, now: u64) -> String {
+    match status {
+        None => "\u{2026}".to_string(),
+        Some(s) => match s.touched {
+            Some(touched) => rel_age(now, touched),
+            None => "-".to_string(),
+        },
     }
+}
+
+/// Compact age for the column: `now`, `45m`, `3h`, `6d`, `3w`, `7mo`, `2y`.
+fn rel_age(now: u64, then: u64) -> String {
+    if then >= now {
+        return "now".to_string();
+    }
+    let mins = (now - then) / 60;
+    if mins < 1 {
+        return "now".to_string();
+    }
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    if days < 7 {
+        return format!("{days}d");
+    }
+    if days < 60 {
+        return format!("{}w", days / 7);
+    }
+    if days < 730 {
+        return format!("{}mo", days / 30);
+    }
+    format!("{}y", days / 365)
+}
+
+/// Spelled-out age for the detail line: `just now`, `5 minutes ago`, ...
+fn age_phrase(now: u64, then: u64) -> String {
+    if then >= now || now - then < 60 {
+        return "just now".to_string();
+    }
+    let secs = now - then;
+    for (unit, name) in [
+        (60 * 60 * 24 * 365, "year"),
+        (60 * 60 * 24 * 30, "month"),
+        (60 * 60 * 24 * 7, "week"),
+        (60 * 60 * 24, "day"),
+        (60 * 60, "hour"),
+        (60, "minute"),
+    ] {
+        let n = secs / unit;
+        if n >= 1 {
+            return format!("{n} {name}{} ago", if n == 1 { "" } else { "s" });
+        }
+    }
+    "just now".to_string()
 }
 
 fn pr_text(cell: PrCell) -> String {
@@ -603,6 +677,17 @@ fn fit_tail(s: &str, w: usize) -> String {
     let mut out = String::from("\u{2026}");
     out.extend(s.chars().skip(n - (w - 1)));
     out
+}
+
+/// Pad on the left instead of the right — the age column reads better aligned
+/// to its numbers.
+fn fit_right(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n >= w {
+        fit(s, w)
+    } else {
+        format!("{}{s}", " ".repeat(w - n))
+    }
 }
 
 /// `fit`/`fit_tail` with the query's matched characters highlighted, over a
@@ -766,6 +851,59 @@ mod tests {
             ),
             "missing"
         );
+    }
+
+    #[test]
+    fn fit_right_aligns_within_the_column() {
+        assert_eq!(fit_right("3d", 5), "   3d");
+        assert_eq!(fit_right("12mo", 5), " 12mo");
+        assert_eq!(fit_right("toolong", 5), "tool\u{2026}");
+    }
+
+    #[test]
+    fn rel_age_picks_the_largest_fitting_unit() {
+        const MIN: u64 = 60;
+        const HOUR: u64 = 60 * MIN;
+        const DAY: u64 = 24 * HOUR;
+        let now = 1_000_000_000;
+        assert_eq!(rel_age(now, now), "now");
+        assert_eq!(rel_age(now, now - 30), "now");
+        assert_eq!(rel_age(now, now - 5 * MIN), "5m");
+        assert_eq!(rel_age(now, now - 59 * MIN), "59m");
+        assert_eq!(rel_age(now, now - 3 * HOUR), "3h");
+        assert_eq!(rel_age(now, now - 6 * DAY), "6d");
+        assert_eq!(rel_age(now, now - 20 * DAY), "2w");
+        assert_eq!(rel_age(now, now - 200 * DAY), "6mo");
+        assert_eq!(rel_age(now, now - 1000 * DAY), "2y");
+        // A worktree touched by a clock ahead of ours must not underflow.
+        assert_eq!(rel_age(now, now + 5000), "now");
+        // Every result has to fit the column.
+        for ago in [0, 90, 4000, 100_000, 9_000_000, 400_000_000] {
+            assert!(rel_age(now, now - ago).chars().count() <= 5, "{ago}");
+        }
+    }
+
+    #[test]
+    fn age_phrase_pluralizes() {
+        let now = 1_000_000_000;
+        assert_eq!(age_phrase(now, now - 10), "just now");
+        assert_eq!(age_phrase(now, now - 60), "1 minute ago");
+        assert_eq!(age_phrase(now, now - 120), "2 minutes ago");
+        assert_eq!(age_phrase(now, now - 86_400), "1 day ago");
+        assert_eq!(age_phrase(now, now - 3 * 86_400), "3 days ago");
+        assert_eq!(age_phrase(now, now + 99), "just now");
+    }
+
+    #[test]
+    fn age_cell_shows_loading_and_unknown_distinctly() {
+        let now = 1_000_000_000;
+        assert_eq!(age_text(None, now), "\u{2026}");
+        assert_eq!(age_text(Some(&Status::default()), now), "-");
+        let touched = Status {
+            touched: Some(now - 7200),
+            ..Default::default()
+        };
+        assert_eq!(age_text(Some(&touched), now), "2h");
     }
 
     #[test]
