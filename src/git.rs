@@ -330,7 +330,7 @@ pub fn status(path: &Path) -> Status {
 ///
 /// Claude Code worktree branches are prefixed `worktree-` and encode `/` as `+`,
 /// but they are pushed with the prefix stripped and the slashes restored — so a
-/// PR for `worktree-brollb+fix` lives on `brollb/fix`.
+/// PR for `worktree-brogan+fix` lives on `brogan/fix`.
 pub fn pr_candidates(branch: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut push = |c: String| {
@@ -364,7 +364,7 @@ branch refs/heads/main
 
 worktree /repo/.claude/worktrees/foo
 HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-branch refs/heads/worktree-brollb+foo
+branch refs/heads/worktree-brogan+foo
 locked
 
 worktree /tmp/gone
@@ -380,7 +380,7 @@ prunable gitdir file points to non-existent location
         assert_eq!(wts[0].repo, 3);
 
         assert!(!wts[1].main);
-        assert_eq!(wts[1].branch.as_deref(), Some("worktree-brollb+foo"));
+        assert_eq!(wts[1].branch.as_deref(), Some("worktree-brogan+foo"));
         assert!(wts[1].locked);
         assert!(!wts[1].prunable);
 
@@ -490,15 +490,15 @@ prunable gitdir file points to non-existent location
     fn pr_candidates_cover_the_worktree_branch_convention() {
         // Pushed with the `worktree-` prefix stripped and `+` restored to `/`.
         assert_eq!(
-            pr_candidates("worktree-brollb+fix-smoke-tests"),
+            pr_candidates("worktree-brogan+fix-smoke-tests"),
             vec![
-                "worktree-brollb+fix-smoke-tests",
-                "worktree-brollb/fix-smoke-tests",
-                "brollb+fix-smoke-tests",
-                "brollb/fix-smoke-tests",
+                "worktree-brogan+fix-smoke-tests",
+                "worktree-brogan/fix-smoke-tests",
+                "brogan+fix-smoke-tests",
+                "brogan/fix-smoke-tests",
             ]
         );
-        assert_eq!(pr_candidates("brollb/plain"), vec!["brollb/plain"]);
+        assert_eq!(pr_candidates("brogan/plain"), vec!["brogan/plain"]);
         assert_eq!(
             pr_candidates("worktree-solo"),
             vec!["worktree-solo", "solo"]

@@ -1198,8 +1198,8 @@ mod tests {
     #[test]
     fn highlighting_does_not_change_the_visible_text() {
         for (s, w, hits, tail) in [
-            ("brollb/loops", 20, vec![7, 8, 9, 10, 11], false),
-            ("brollb/loops", 6, vec![0, 1], false),
+            ("brogan/cache", 20, vec![7, 8, 9, 10, 11], false),
+            ("brogan/cache", 6, vec![0, 1], false),
             ("/a/very/long/path", 8, vec![13, 14, 15, 16], true),
             ("exact", 5, vec![0, 4], false),
         ] {
@@ -1336,7 +1336,7 @@ mod tests {
         let rows = vec![Row::Item(0, Hits::default())];
         let marked = HashSet::new();
         for mode in [Mode::Normal, Mode::Search] {
-            for query in ["", "loops", "a b"] {
+            for query in ["", "cache", "a b"] {
                 let f = frame(query, mode, &marked);
                 let out = search_line(&f, &rows, 42, 60, true);
                 assert_eq!(visible(&out).chars().count(), 60, "{query:?}");
@@ -1358,22 +1358,22 @@ mod tests {
         assert!(idle.contains("press / to search"), "{idle:?}");
         // A filter that is applied but not being edited still shows itself.
         let applied = visible(&search_line(
-            &frame("loops", Mode::Normal, &marked),
+            &frame("cache", Mode::Normal, &marked),
             &rows,
             1,
             60,
             false,
         ));
-        assert!(applied.contains("/loops"), "{applied:?}");
+        assert!(applied.contains("/cache"), "{applied:?}");
         assert!(!applied.contains('\u{258c}'), "no caret when not editing");
         let editing = visible(&search_line(
-            &frame("loops", Mode::Search, &marked),
+            &frame("cache", Mode::Search, &marked),
             &rows,
             1,
             60,
             false,
         ));
-        assert!(editing.contains("/loops\u{258c}"), "{editing:?}");
+        assert!(editing.contains("/cache\u{258c}"), "{editing:?}");
     }
 
     fn app_with(paths: &[&str]) -> App {

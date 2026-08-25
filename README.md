@@ -9,14 +9,14 @@ deleting worktrees you are done with; piped, it prints tab-separated lines, so
 the same command works in a terminal and in a script.
 
 ```
- 23 worktrees in ~/baseten/trainers  ·  8 with an open PR
- /loops worker                                              2 marked  ·  3/23
+ 23 worktrees in ~/src/toolkit  ·  8 with an open PR
+ /cache worker                                              2 marked  ·  3/23
    PR       BRANCH                                   STATUS          AGE  PATH
-▸  #837     brollb/loops-worker                      ↑3                2h  …/brollb+loops-worker
- ● #1003    brollb/loops-worker-drop-storage-dir     clean             3d  …/loops-harness-fixes
- ● -        brollb/pickable-sampling-client          ↓12 ●1            5w  …/brollb/pickable-sampling-client
+▸  #42      brogan/cache-worker                      ↑3                2h  …/brogan+cache-worker
+ ● #57      brogan/cache-worker-drop-storage-dir     clean             3d  …/cache-harness-fixes
+ ● -        brogan/pickable-sampling-client          ↓12 ●1            5w  …/brogan/pickable-sampling-client
 
-  modified 2 hours ago  ·  #837 (draft) feat(loops): real Megatron worker behind the broker
+  modified 2 hours ago  ·  #42 (draft) feat(cache): real worker behind the broker
   /: search  ·  space: mark  ·  d: delete  ·  enter: select  ·  s: sort  ·  o: PR  ·  q: quit
 ```
 
@@ -37,7 +37,7 @@ ln -s "$(command -v grove)" ~/.cargo/bin/git-grove   # then: git grove
 
 ```sh
 grove                  # worktrees of the repo you are standing in
-grove ~/baseten        # a directory of repos: every repo beneath it
+grove ~/src            # a directory of repos: every repo beneath it
 grove --json | jq .    # machine-readable
 ```
 
@@ -71,9 +71,9 @@ returns to the list with the filter still applied. `esc` from there clears it.
 
 `/` fuzzy-matches the branch, path, PR number and (when more than one repo is
 listed) the repo name, best match first, with the matched characters
-highlighted. Space-separated tokens all have to match, so `trainers loops`
-narrows to loops branches in the trainers repo, and `837` finds a worktree by
-its PR number.
+highlighted. Space-separated tokens all have to match, so `toolkit cache`
+narrows to cache branches in the toolkit repo, and `42` finds a worktree by its
+PR number.
 
 ### Deleting worktrees
 
@@ -184,7 +184,7 @@ usage, `130` picker cancelled.
   `gh`, or on a non-GitHub remote, the PR column degrades to `-` and the reason
   is shown under the list.
 - Branch names are matched against PR head branches allowing for the Claude Code
-  worktree convention: `worktree-brollb+fix` is pushed as `brollb/fix`.
+  worktree convention: `worktree-brogan+fix` is pushed as `brogan/fix`.
 - In the picker, `git status` is only run for the rows on screen, so a
   248-worktree directory draws immediately and fills in as you scroll.
 - Ages come from a second, much cheaper pass — a `git log -1` and a stat, no

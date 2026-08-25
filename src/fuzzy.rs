@@ -84,7 +84,7 @@ pub fn best_match(haystack: &str, needle: &str) -> Option<Match> {
 
     // Then pull every character as far right as it can go without passing the
     // end of the forward match. This turns scattered matches into consecutive
-    // runs where one exists (`lps` over `.../brollb+lps-993`).
+    // runs where one exists (`abc` over `.../brogan+abc-123`).
     let mut backward = vec![0usize; ned.len()];
     let mut j = *forward.last().expect("needle is non-empty") as isize;
     for k in (0..ned_cmp.len()).rev() {
@@ -206,43 +206,45 @@ mod tests {
 
     #[test]
     fn requires_a_subsequence() {
-        assert!(best_match("brollb/loops-worker", "lw").is_some());
-        assert!(best_match("brollb/loops-worker", "wl").is_none());
+        assert!(best_match("brogan/cache-worker", "cw").is_some());
+        assert!(best_match("brogan/cache-worker", "wc").is_none());
         assert!(best_match("short", "muchlonger").is_none());
         assert!(best_match("anything", "").unwrap().positions.is_empty());
     }
 
     #[test]
     fn smart_case() {
-        assert!(best_match("brollb/Loops", "loops").is_some());
-        assert!(best_match("brollb/loops", "Loops").is_none());
-        assert!(best_match("brollb/Loops", "Loops").is_some());
+        assert!(best_match("brogan/Cache", "cache").is_some());
+        assert!(best_match("brogan/cache", "Cache").is_none());
+        assert!(best_match("brogan/Cache", "Cache").is_some());
     }
 
     #[test]
     fn consecutive_beats_scattered() {
-        assert!(score_of("loops-broker", "loops") > score_of("l-o-o-p-s-x", "loops"));
+        assert!(score_of("cache-broker", "cache") > score_of("c-a-c-h-e-x", "cache"));
     }
 
     #[test]
     fn word_boundaries_beat_mid_word() {
-        // `lb` as the start of two segments beats `lb` inside one word.
-        assert!(score_of("loops/broker", "lb") > score_of("albatross", "lb"));
+        // `ab` as the start of two segments beats `ab` inside one word. The
+        // first segment must not contain the second character, or the greedy
+        // pass takes it there and never reaches the boundary.
+        assert!(score_of("alpha/beta", "ab") > score_of("albatross", "ab"));
     }
 
     #[test]
     fn prefers_the_tighter_run_further_right() {
-        // The greedy leftmost match would take `l` from `brollb`; the backward
-        // pass should find the consecutive `lps` instead.
-        let m = best_match("brollb+lps-993-turn-gate", "lps").unwrap();
+        // The greedy leftmost match would take `a` from `brogan`; the backward
+        // pass should find the consecutive `abc` instead.
+        let m = best_match("brogan+abc-123-turn-gate", "abc").unwrap();
         assert_eq!(m.positions, vec![7, 8, 9]);
     }
 
     #[test]
     fn tightens_onto_a_real_branch_name() {
-        // `brok` should land on `broker`, not on b-r-o from `brollb` plus a
+        // `brok` should land on `broker`, not on b-r-o from `brogan` plus a
         // stray `k`.
-        let m = best_match("brollb/loops-broker-direct", "brok").unwrap();
+        let m = best_match("brogan/cache-broker-direct", "brok").unwrap();
         assert_eq!(m.positions, vec![13, 14, 15, 16]);
     }
 
@@ -264,24 +266,21 @@ mod tests {
     #[test]
     fn every_token_must_match_some_field() {
         let f = fields(
-            "brollb/loops-worker",
-            "…/brollb+loops-worker",
-            "trainers",
-            Some("#837"),
+            "brogan/cache-worker",
+            "…/brogan+cache-worker",
+            "toolkit",
+            Some("#42"),
         );
-        assert!(match_fields(&f, "loops").is_some());
-        assert!(
-            match_fields(&f, "trainers loops").is_some(),
-            "repo + branch"
-        );
-        assert!(match_fields(&f, "837").is_some(), "PR number");
-        assert!(match_fields(&f, "loops nonexistent").is_none());
+        assert!(match_fields(&f, "cache").is_some());
+        assert!(match_fields(&f, "toolkit cache").is_some(), "repo + branch");
+        assert!(match_fields(&f, "42").is_some(), "PR number");
+        assert!(match_fields(&f, "cache nonexistent").is_none());
     }
 
     #[test]
     fn branch_matches_outrank_path_matches() {
-        let on_branch = fields("brollb/metrics", "…/aaa", "repo", None);
-        let on_path = fields("brollb/aaa", "…/metrics", "repo", None);
+        let on_branch = fields("brogan/metrics", "…/aaa", "repo", None);
+        let on_path = fields("brogan/aaa", "…/metrics", "repo", None);
         assert!(
             match_fields(&on_branch, "metrics").unwrap().score
                 > match_fields(&on_path, "metrics").unwrap().score
@@ -290,8 +289,8 @@ mod tests {
 
     #[test]
     fn hits_are_collected_from_every_field_that_matched() {
-        let f = fields("loops", "…/loops-x", "repo", None);
-        let hits = match_fields(&f, "loops").unwrap();
+        let f = fields("cache", "…/cache-x", "repo", None);
+        let hits = match_fields(&f, "cache").unwrap();
         assert_eq!(hits.branch, vec![0, 1, 2, 3, 4]);
         assert_eq!(hits.path, vec![2, 3, 4, 5, 6]);
     }
