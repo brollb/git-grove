@@ -18,7 +18,7 @@ tab-separated lines, so the same command works in a terminal and in a script.
  ● -        brogan/pickable-sampling-client          ↓12 ●1            5w  …/brogan/pickable-sampling-client
 
   modified 2 hours ago  ·  #42 (draft) feat(cache): real worker behind the broker
-  /: search  ·  n: new  ·  space: mark  ·  d: delete  ·  enter: select  ·  s: sort  ·  o: PR  ·  q: quit
+  /: search  ·  n: new  ·  space: mark  ·  d: delete  ·  enter: open  ·  s: sort  ·  o: PR  ·  q: quit
 ```
 
 ## Install
@@ -59,7 +59,7 @@ the letters free for acting on the list.
 | `space` | mark the worktree under the cursor, and move down |
 | `a` | mark every listed worktree, or unmark them if they already are |
 | `d` | delete the marked worktrees — or the one under the cursor |
-| `enter` | select |
+| `enter` | open a shell in the worktree, and come back here when it exits |
 | `s` | cycle the sort: by name → newest first → oldest first |
 | `o` | open the PR in a browser |
 | `esc` | clear the filter, or quit when there is none |
@@ -144,12 +144,9 @@ while they land.
 
 ### Jumping to a worktree
 
-`--cd` opens a shell in the worktree you pick and returns you to the picker when
-that shell exits, so you can hop between worktrees without retyping paths:
-
-```sh
-alias cdw='grove --cd'
-```
+`enter` opens a shell in the worktree under the cursor and returns you to the
+picker when that shell exits, so you can hop between worktrees without retyping
+paths.
 
 `ctrl-d` (or `exit`) leaves the worktree shell and puts the picker back up with
 your query and cursor where you left them; `esc` from there ends the session and
@@ -157,8 +154,9 @@ returns you to the shell you started in, in the directory you started in. The
 worktree shell is a child process — it is `$SHELL` started with its working
 directory set — so nothing is changed in the calling shell.
 
-To change the calling shell's own directory instead, use `--pick`, which draws
-the list on `/dev/tty` and prints only the selection to stdout:
+To change the calling shell's own directory instead, use `--pick`. `enter` then
+prints the selected path to stdout and exits, with the list still drawn on
+`/dev/tty` so it stays out of the way of a redirect:
 
 ```sh
 wt() { cd "$(grove --pick "$@")" || return; }
@@ -170,17 +168,16 @@ Cancelling exits 130 with nothing on stdout, so `cd` is left alone.
 
 | Option | Effect |
 | --- | --- |
-| `-c`, `--cd` | open a shell in the selected worktree, then return to the picker |
 | `-q`, `--query Q` | start with the filter pre-filled; also filters `--plain`/`--json` |
 | `-S`, `--sort S` | order by `name` (default), `recent`, or `oldest` |
-| `-p`, `--pick` | force the picker, printing the selection to stdout |
+| `-p`, `--pick` | make `enter` print the selected path and exit, instead of opening a shell |
 | `--plain` | force tab-separated output: `path`, `branch`, `head`, `pr`, `flags` |
 | `-j`, `--json` | JSON output |
 | `-s`, `--status` | include working-tree status and last-modified time in `--plain`/`--json` output |
 | `--no-pr` | skip the GitHub lookup |
 
-Exit codes: `0` listed or selected, `1` nothing found or a fatal error, `2` bad
-usage, `130` picker cancelled.
+Exit codes: `0` listed or the picker was left, `1` nothing found or a fatal
+error, `2` bad usage, `130` `--pick` cancelled, so nothing was printed.
 
 ## Columns
 

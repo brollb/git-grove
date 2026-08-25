@@ -50,10 +50,14 @@ enum Prompt {
 }
 
 /// Query and cursor, kept across picker visits so that returning from a
-/// worktree shell (`--cd`) lands you back where you were.
+/// worktree shell lands you back where you were.
 #[derive(Default)]
 pub struct PickerState {
     pub query: String,
+    /// `--pick`: enter prints the path and leaves instead of opening a shell.
+    /// Only the footer hint changes in here — acting on the selection is the
+    /// caller's business either way.
+    pub picking: bool,
     sel: usize,
     off: usize,
     /// Worktrees marked with space, by path so that marks survive the list
@@ -164,6 +168,7 @@ pub fn run(
                 creating: &creating,
                 prompt: prompt.as_ref(),
                 message: message.as_deref(),
+                picking: state.picking,
             };
             draw(&mut tty, app, &frame)?;
             dirty = false;
@@ -773,6 +778,7 @@ struct Frame<'a> {
     creating: &'a [String],
     prompt: Option<&'a Prompt>,
     message: Option<&'a str>,
+    picking: bool,
 }
 
 fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
@@ -960,7 +966,7 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
         match (f.prompt, f.message) {
             (Some(prompt), _) => paint(YELLOW, &fit(&prompt_text(prompt), width), color),
             (None, Some(message)) => fit(message, width),
-            (None, None) => paint(DIM, &fit(hints(f.mode), width), color),
+            (None, None) => paint(DIM, &fit(hints(f.mode, f.picking), width), color),
         }
     };
     line(&mut buf, &footer);
@@ -1022,10 +1028,13 @@ fn prompt_text(prompt: &Prompt) -> String {
     }
 }
 
-fn hints(mode: Mode) -> &'static str {
+fn hints(mode: Mode, picking: bool) -> &'static str {
     match mode {
-        Mode::Normal => {
+        Mode::Normal if picking => {
             "  /: search  \u{b7}  n: new  \u{b7}  space: mark  \u{b7}  d: delete  \u{b7}  enter: select  \u{b7}  s: sort  \u{b7}  o: PR  \u{b7}  q: quit"
+        }
+        Mode::Normal => {
+            "  /: search  \u{b7}  n: new  \u{b7}  space: mark  \u{b7}  d: delete  \u{b7}  enter: open  \u{b7}  s: sort  \u{b7}  o: PR  \u{b7}  q: quit"
         }
         Mode::Search => {
             "  type to filter  \u{b7}  enter/esc: back to the list  \u{b7}  \u{2191}/\u{2193}: move"
@@ -1473,6 +1482,7 @@ mod tests {
             creating: &[],
             prompt: None,
             message: None,
+            picking: false,
         }
     }
 

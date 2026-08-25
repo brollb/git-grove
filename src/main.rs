@@ -29,17 +29,16 @@ DIRECTORY defaults to the current directory. If it is inside a git repo, that
 repo's worktrees are listed; otherwise every repo directly beneath it is scanned.
 
 Interactive by default on a TTY: / opens a fuzzy filter, n creates a worktree,
-space marks worktrees and d deletes them, enter prints the selected worktree
-path, s cycles the sort order, o opens its PR, q quits.
+space marks worktrees and d deletes them, enter opens a shell in the selected
+worktree and returns to the picker when that shell exits (ctrl-d), s cycles the
+sort order, o opens its PR, q quits.
 
 OPTIONS:
-    -c, --cd        open a shell in the worktree you select, and return to the
-                    picker when that shell exits (ctrl-d)
     -q, --query Q   start with the filter box pre-filled; filters --plain and
                     --json output too
     -S, --sort S    order the list: name (default), recent, oldest
-    -p, --pick      force the interactive picker, printing the selection to
-                    stdout even when stdout is redirected
+    -p, --pick      make enter print the selected path to stdout and exit,
+                    instead of opening a shell; works when stdout is redirected
                         cd \"$(grove --pick)\"
         --plain     force tab-separated output:
                         path <TAB> branch <TAB> head <TAB> pr <TAB> flags
@@ -51,10 +50,10 @@ OPTIONS:
     -V, --version   print the version
 
 EXIT CODES:
-    0  listed, or a worktree was selected
+    0  listed, or the picker was left
     1  no worktrees found, or a fatal error
     2  bad usage
-  130  the picker was cancelled
+  130  --pick was cancelled, so nothing was printed
 ";
 
 struct Opts {
@@ -62,7 +61,6 @@ struct Opts {
     json: bool,
     plain: bool,
     pick: bool,
-    cd: bool,
     prs: bool,
     status: bool,
     query: String,
@@ -75,7 +73,6 @@ fn parse_args() -> Result<Option<Opts>, String> {
         json: false,
         plain: false,
         pick: false,
-        cd: false,
         prs: true,
         status: false,
         query: String::new(),
@@ -122,7 +119,6 @@ fn parse_args() -> Result<Option<Opts>, String> {
             "-j" | "--json" => opts.json = true,
             "--plain" => opts.plain = true,
             "-p" | "--pick" => opts.pick = true,
-            "-c" | "--cd" => opts.cd = true,
             "-q" | "--query" => want_query = true,
             "-S" | "--sort" => want_sort = true,
             "-s" | "--status" => opts.status = true,
@@ -172,9 +168,8 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let interactive =
-        (opts.pick || opts.cd || (std::io::stdout().is_terminal() && !opts.plain && !opts.json))
-            && ui::tty_available();
+    let interactive = (opts.pick || (std::io::stdout().is_terminal() && !opts.plain && !opts.json))
+        && ui::tty_available();
     let color = interactive
         && env::var_os("NO_COLOR").is_none()
         && env::var("TERM").as_deref() != Ok("dumb");
@@ -190,9 +185,10 @@ fn main() -> ExitCode {
 
     if interactive {
         let mut state = ui::PickerState::with_query(opts.query.clone());
-        if opts.cd {
+        if !opts.pick {
             return shell_loop(&mut app, &mut loader, &rx, &mut state);
         }
+        state.picking = true;
         return match ui::run(&mut app, &mut loader, &rx, &mut state) {
             Ok(Some(path)) => {
                 println!("{}", path.display());
@@ -255,8 +251,9 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `--cd`: hand the selected worktree to a shell, and come back to the picker
-/// when that shell exits, until the user quits the picker itself.
+/// What enter does by default: hand the selected worktree to a shell, and come
+/// back to the picker when that shell exits, until the user quits the picker
+/// itself.
 fn shell_loop(
     app: &mut App,
     loader: &mut load::Loader,
