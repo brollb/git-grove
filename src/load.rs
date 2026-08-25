@@ -15,6 +15,8 @@ pub enum Msg {
     Status(PathBuf, Status),
     /// A worktree removal finished, successfully or not.
     Removed(PathBuf, Result<(), String>),
+    /// A worktree creation finished: the repo it belongs to, and the new path.
+    Added(usize, Result<PathBuf, String>),
     /// The cheap age estimate for a worktree.
     Age(PathBuf, Option<u64>),
     /// PRs for the repo at this index, or the reason they are unavailable.
@@ -29,11 +31,24 @@ enum Kind {
 
 type Queue = Arc<(Mutex<Vec<(Kind, PathBuf)>>, Condvar)>;
 
+/// Work that changes which worktrees a repo has.
+enum RepoJob {
+    Remove {
+        path: PathBuf,
+        force: bool,
+    },
+    Add {
+        repo: usize,
+        path: PathBuf,
+        branch: String,
+    },
+}
+
 pub struct Loader {
     queue: Queue,
     requested: HashSet<(bool, PathBuf)>,
-    /// One removal channel per repo — see [`Loader::remove`].
-    removers: HashMap<PathBuf, Sender<(PathBuf, bool)>>,
+    /// One job channel per repo — see [`Loader::repo_job`].
+    removers: HashMap<PathBuf, Sender<RepoJob>>,
     tx: Sender<Msg>,
 }
 
@@ -84,30 +99,53 @@ impl Loader {
         true
     }
 
-    /// Remove a worktree off the UI thread, reporting the result as a message.
-    ///
-    /// Each repo gets one removal thread, so removals within a repo run one at
-    /// a time and cannot race each other's administrative files (a `prune` for
-    /// one stale worktree could otherwise clear an entry another removal is
-    /// still working on), while separate repos proceed in parallel. Deleting a
-    /// worktree means an `rm -rf` of a whole checkout, so this can take a while
-    /// per worktree — hence not on the thread that draws the screen.
+    /// Delete a worktree off the UI thread, reporting the result as a message.
     pub fn remove(&mut self, repo_main: &Path, path: PathBuf, force: bool) {
+        self.repo_job(repo_main, RepoJob::Remove { path, force });
+    }
+
+    /// Create a worktree off the UI thread, reporting the result as a message.
+    pub fn add(&mut self, repo_main: &Path, repo: usize, path: PathBuf, branch: String) {
+        self.repo_job(repo_main, RepoJob::Add { repo, path, branch });
+    }
+
+    /// Queue work that mutates a repo's worktrees.
+    ///
+    /// Each repo gets one thread, so this work runs one item at a time within a
+    /// repo and cannot race another item's administrative files (a `prune` for
+    /// one stale worktree could otherwise clear an entry a removal is still
+    /// working on), while separate repos proceed in parallel. Both adding and
+    /// removing move a whole checkout around, so neither belongs on the thread
+    /// that draws the screen.
+    fn repo_job(&mut self, repo_main: &Path, job: RepoJob) {
         let tx = self.tx.clone();
-        let repo = repo_main.to_path_buf();
-        let sender = self.removers.entry(repo.clone()).or_insert_with(move || {
-            let (jobs_tx, jobs_rx) = channel::<(PathBuf, bool)>();
-            thread::spawn(move || {
-                for (path, force) in jobs_rx {
-                    let result = git::remove_worktree(&repo, &path, force);
-                    if tx.send(Msg::Removed(path, result)).is_err() {
-                        return; // receiver gone: we are shutting down
+        let repo_main = repo_main.to_path_buf();
+        let sender = self
+            .removers
+            .entry(repo_main.clone())
+            .or_insert_with(move || {
+                let (jobs_tx, jobs_rx) = channel::<RepoJob>();
+                thread::spawn(move || {
+                    for job in jobs_rx {
+                        let msg = match job {
+                            RepoJob::Remove { path, force } => {
+                                let result = git::remove_worktree(&repo_main, &path, force);
+                                Msg::Removed(path, result)
+                            }
+                            RepoJob::Add { repo, path, branch } => {
+                                let result = git::add_worktree(&repo_main, &path, &branch)
+                                    .map(|()| path.clone());
+                                Msg::Added(repo, result)
+                            }
+                        };
+                        if tx.send(msg).is_err() {
+                            return; // receiver gone: we are shutting down
+                        }
                     }
-                }
+                });
+                jobs_tx
             });
-            jobs_tx
-        });
-        let _ = sender.send((path, force));
+        let _ = sender.send(job);
     }
 
     /// Drop the memos for `path` so it is recomputed on next request — used

@@ -1,6 +1,6 @@
 //! Discovering and inspecting git worktrees by shelling out to `git`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -87,6 +87,72 @@ fn git_result(dir: &Path, args: &[&str]) -> Result<String, String> {
         .trim_start_matches("fatal: ")
         .to_string();
     Err(reason)
+}
+
+/// Where this repo keeps its linked worktrees: wherever most of them already
+/// live, so a new one lands beside its siblings whatever layout is in use.
+///
+/// With no linked worktrees to learn from, they go in a directory next to the
+/// repo rather than inside it, where an untracked directory would show up in
+/// every `git status`.
+pub fn worktree_home(repo: &Repo) -> PathBuf {
+    let mut counts: HashMap<&Path, usize> = HashMap::new();
+    for wt in repo.worktrees.iter().filter(|w| !w.main) {
+        if let Some(parent) = wt.path.parent() {
+            *counts.entry(parent).or_default() += 1;
+        }
+    }
+    // Ties break towards the shallower path, so the answer is stable rather
+    // than dependent on hash order.
+    if let Some((parent, _)) = counts
+        .iter()
+        .max_by_key(|(parent, n)| (**n, std::cmp::Reverse(parent.components().count())))
+    {
+        return parent.to_path_buf();
+    }
+    let name = repo
+        .main_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repo".to_string());
+    match repo.main_path.parent() {
+        Some(parent) => parent.join(format!("{name}-worktrees")),
+        None => repo.main_path.join(".worktrees"),
+    }
+}
+
+/// A branch name as a directory name: `/` would nest, so it is folded to `+`,
+/// which is what the worktree tooling here already produces.
+pub fn worktree_dir_name(branch: &str) -> String {
+    branch.trim().trim_matches('/').replace('/', "+")
+}
+
+/// Create a worktree for `branch`, making the branch if it does not exist yet.
+///
+/// A new branch starts from whatever the repo's main worktree has checked out.
+pub fn add_worktree(repo_main: &Path, path: &Path, branch: &str) -> Result<(), String> {
+    let existing = git(
+        repo_main,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_some();
+    let path = path.to_string_lossy();
+    let args: Vec<&str> = if existing {
+        vec!["worktree", "add", &path, branch]
+    } else {
+        vec!["worktree", "add", "-b", branch, &path]
+    };
+    git_result(repo_main, &args).map(|_| ())
+}
+
+/// Re-read one repo's worktrees, after adding or removing one.
+pub fn relist(main_path: &Path, idx: usize) -> Option<Repo> {
+    repo_at(main_path, idx)
 }
 
 /// Remove a worktree from disk and drop its administrative entry.
@@ -424,6 +490,107 @@ prunable gitdir file points to non-existent location
         let wt = root.join("wt");
         run(&root, &["worktree", "add", "-q", "wt", "-b", "feature"]);
         (root, wt)
+    }
+
+    fn repo_with(main: &str, linked: &[&str]) -> Repo {
+        let mut worktrees = vec![Worktree {
+            path: PathBuf::from(main),
+            head: "abc".to_string(),
+            branch: Some("main".to_string()),
+            bare: false,
+            detached: false,
+            locked: false,
+            prunable: false,
+            repo: 0,
+            main: true,
+        }];
+        for (n, path) in linked.iter().enumerate() {
+            worktrees.push(Worktree {
+                path: PathBuf::from(path),
+                head: "abc".to_string(),
+                branch: Some(format!("b{n}")),
+                bare: false,
+                detached: false,
+                locked: false,
+                prunable: false,
+                repo: 0,
+                main: false,
+            });
+        }
+        Repo {
+            label: "repo".to_string(),
+            main_path: PathBuf::from(main),
+            worktrees,
+        }
+    }
+
+    #[test]
+    fn new_worktrees_follow_the_layout_already_in_use() {
+        let repo = repo_with(
+            "/src/repo",
+            &[
+                "/src/repo/.claude/worktrees/one",
+                "/src/repo/.claude/worktrees/two",
+                "/elsewhere/three",
+            ],
+        );
+        assert_eq!(
+            worktree_home(&repo),
+            PathBuf::from("/src/repo/.claude/worktrees"),
+            "the majority layout wins over the one-off"
+        );
+    }
+
+    #[test]
+    fn with_no_worktrees_to_learn_from_they_go_beside_the_repo() {
+        // Never inside the repo, where an untracked directory would turn up in
+        // every `git status`.
+        let repo = repo_with("/src/repo", &[]);
+        assert_eq!(worktree_home(&repo), PathBuf::from("/src/repo-worktrees"));
+    }
+
+    #[test]
+    fn branch_names_become_flat_directory_names() {
+        assert_eq!(worktree_dir_name("fix"), "fix");
+        assert_eq!(worktree_dir_name("brogan/fix"), "brogan+fix");
+        assert_eq!(worktree_dir_name("a/b/c"), "a+b+c");
+        assert_eq!(worktree_dir_name("  spaced  "), "spaced");
+        assert_eq!(worktree_dir_name("/leading"), "leading");
+    }
+
+    #[test]
+    fn adds_a_worktree_for_a_new_branch() {
+        let (root, _) = scratch_repo("add-new");
+        let path = root.join("added");
+        assert_eq!(add_worktree(&root, &path, "brand-new"), Ok(()));
+        assert!(path.join(".git").exists(), "a worktree lives there now");
+        let branches = git(&root, &["branch", "--list", "brand-new"]).unwrap();
+        assert!(branches.contains("brand-new"), "the branch was created");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adds_a_worktree_for_a_branch_that_already_exists() {
+        let (root, _) = scratch_repo("add-existing");
+        run(&root, &["branch", "prior"]);
+        let path = root.join("prior-wt");
+        assert_eq!(add_worktree(&root, &path, "prior"), Ok(()));
+        let listed = list_worktrees_for_test(&root);
+        assert!(
+            listed.iter().any(|w| w.branch.as_deref() == Some("prior")),
+            "the existing branch was checked out, not duplicated"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refuses_a_branch_that_is_already_checked_out() {
+        let (root, wt) = scratch_repo("add-dup");
+        // `feature` is checked out in the worktree scratch_repo made.
+        let err = add_worktree(&root, &root.join("second"), "feature").unwrap_err();
+        assert!(!err.is_empty(), "git's complaint is passed through");
+        assert!(wt.exists(), "the original is untouched");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

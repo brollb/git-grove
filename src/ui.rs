@@ -13,7 +13,7 @@ use crossterm::{execute, terminal};
 use crate::app::{App, PrCell, Sort};
 use crate::fuzzy::Hits;
 use crate::gh;
-use crate::git::Status;
+use crate::git::{self, Status};
 use crate::load::{Loader, Msg};
 
 const RESET: &str = "\x1b[0m";
@@ -37,6 +37,8 @@ enum Row {
 enum Mode {
     Normal,
     Search,
+    /// Typing the branch name for a new worktree.
+    Create,
 }
 
 /// A destructive action waiting on a keypress.
@@ -118,6 +120,9 @@ pub fn run(
     let mut prompt: Option<Prompt> = None;
     let mut message: Option<String> = None;
     let mut batch = Batch::default();
+    let mut new_branch = String::new();
+    // Branch names whose worktrees are still being checked out.
+    let mut creating: Vec<String> = Vec::new();
     let selected;
 
     loop {
@@ -155,6 +160,8 @@ pub fn run(
                 marked: &state.marked,
                 removing: &batch.pending,
                 progress: &progress,
+                new_branch: &new_branch,
+                creating: &creating,
                 prompt: prompt.as_ref(),
                 message: message.as_deref(),
             };
@@ -233,6 +240,31 @@ pub fn run(
                             }
                             _ => message = Some("  cancelled".to_string()),
                         }
+                    } else if mode == Mode::Create {
+                        match key.code {
+                            KeyCode::Esc => {
+                                mode = Mode::Normal;
+                                new_branch.clear();
+                            }
+                            KeyCode::Enter => {
+                                let branch = new_branch.trim().to_string();
+                                mode = Mode::Normal;
+                                new_branch.clear();
+                                match create_target(app, &rows, sel, &branch) {
+                                    Err(why) => message = Some(format!("  {why}")),
+                                    Ok((repo, path)) => {
+                                        creating.push(branch.clone());
+                                        loader.add(&app.repos[repo].main_path, repo, path, branch);
+                                    }
+                                }
+                            }
+                            KeyCode::Char('u') if ctrl => new_branch.clear(),
+                            KeyCode::Backspace => {
+                                new_branch.pop();
+                            }
+                            KeyCode::Char(c) if !ctrl && !alt => new_branch.push(c),
+                            _ => {}
+                        }
                     } else if mode == Mode::Search {
                         match key.code {
                             KeyCode::Enter | KeyCode::Esc => mode = Mode::Normal,
@@ -263,6 +295,16 @@ pub fn run(
                     } else {
                         match key.code {
                             KeyCode::Char('/') => mode = Mode::Search,
+                            // Guarded, or this would swallow ctrl-n below.
+                            KeyCode::Char('n') if !ctrl => {
+                                if rows.is_empty() {
+                                    message =
+                                        Some("  no repo here to add a worktree to".to_string());
+                                } else {
+                                    mode = Mode::Create;
+                                    new_branch.clear();
+                                }
+                            }
                             KeyCode::Char('q') => {
                                 selected = None;
                                 break;
@@ -380,10 +422,20 @@ pub fn run(
         let mut prs_arrived = false;
         let mut ages_arrived = false;
         let mut removal_arrived = false;
+        let mut added: Option<PathBuf> = None;
         while let Ok(msg) = rx.try_recv() {
             prs_arrived |= matches!(msg, Msg::Prs(..));
             ages_arrived |= matches!(msg, Msg::Age(..) | Msg::Status(..));
-            if let Msg::Removed(path, result) = msg {
+            if let Msg::Added(repo, result) = msg {
+                match result {
+                    Ok(path) => {
+                        app.rescan_repo(repo);
+                        added = Some(path);
+                    }
+                    Err(why) => message = Some(format!("  {why}")),
+                }
+                creating.pop();
+            } else if let Msg::Removed(path, result) = msg {
                 batch.pending.remove(&path);
                 match result {
                     Ok(()) => batch.removed.push(path),
@@ -403,6 +455,31 @@ pub fn run(
         }
         // PR numbers are searchable, so late-arriving PRs can change the match
         // set; newly dated rows can change a recency sort's order.
+        if let Some(path) = added {
+            // A new worktree is easy to lose in a long list, so put the cursor
+            // on it and clear a filter that would have hidden it.
+            if !state.query.trim().is_empty()
+                && app
+                    .filter(&state.query)
+                    .iter()
+                    .all(|(i, _)| app.worktrees[*i].path != path)
+            {
+                state.query.clear();
+            }
+            rows = build_rows(app, &state.query);
+            sel = rows
+                .iter()
+                .position(|r| matches!(r, Row::Item(i, _) if app.worktrees[*i].path == path))
+                .unwrap_or(sel.min(rows.len().saturating_sub(1)));
+            loader.request_status(&path);
+            loader.request_age(&path);
+            message = Some(format!(
+                "  created {}",
+                crate::app::display_path(&path, Some(&app.root))
+            ));
+            dirty = true;
+        }
+
         let resort = ages_arrived && app.sort != Sort::Name;
         if batch_done || resort || (prs_arrived && !state.query.trim().is_empty()) {
             let keep = match rows.get(sel) {
@@ -540,6 +617,34 @@ impl Removal {
     }
 }
 
+/// The repo a new worktree belongs to — the one the cursor is in — and the path
+/// it should occupy.
+fn create_target(
+    app: &App,
+    rows: &[Row],
+    sel: usize,
+    branch: &str,
+) -> Result<(usize, PathBuf), String> {
+    if branch.is_empty() {
+        return Err("no branch name given".to_string());
+    }
+    let repo = match rows.get(sel) {
+        Some(Row::Item(i, _)) => app.worktrees[*i].repo,
+        // With everything filtered out there is still only one repo in the
+        // common case; anything else is ambiguous, so ask for a selection.
+        _ if app.repos.len() == 1 => 0,
+        _ => return Err("select a worktree first, to say which repo".to_string()),
+    };
+    let path = git::worktree_home(&app.repos[repo]).join(git::worktree_dir_name(branch));
+    if path.exists() {
+        return Err(format!(
+            "{} already exists",
+            crate::app::display_path(&path, Some(&app.root))
+        ));
+    }
+    Ok((repo, path))
+}
+
 /// Why a worktree cannot be removed at all, decided before any git call.
 fn cannot_remove(wt: &crate::git::Worktree) -> Option<String> {
     wt.main
@@ -664,6 +769,8 @@ struct Frame<'a> {
     marked: &'a HashSet<PathBuf>,
     removing: &'a HashSet<PathBuf>,
     progress: &'a str,
+    new_branch: &'a str,
+    creating: &'a [String],
     prompt: Option<&'a Prompt>,
     message: Option<&'a str>,
 }
@@ -814,7 +921,34 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
         _ => String::new(),
     };
     line(&mut buf, &fit(&detail, width));
-    let footer = if !f.removing.is_empty() {
+    let footer = if f.mode == Mode::Create {
+        let repo = match f.rows.get(f.sel) {
+            Some(Row::Item(i, _)) if app.repos.len() > 1 => {
+                format!(" in {}", app.repos[app.worktrees[*i].repo].label)
+            }
+            _ => String::new(),
+        };
+        paint(
+            YELLOW,
+            &fit(
+                &format!(
+                    "  new worktree{repo}, branch: {}\u{258c}   esc: cancel",
+                    f.new_branch
+                ),
+                width,
+            ),
+            color,
+        )
+    } else if !f.creating.is_empty() {
+        paint(
+            YELLOW,
+            &fit(
+                &format!("  checking out {}\u{2026}", f.creating.join(", ")),
+                width,
+            ),
+            color,
+        )
+    } else if !f.removing.is_empty() {
         // Progress keeps ticking, but anything the picker needs to say (such as
         // why `q` did nothing) rides along with it rather than replacing it.
         let text = match f.message {
@@ -851,6 +985,14 @@ fn search_line(f: &Frame, rows: &[Row], total: usize, width: usize, color: bool)
             format!(" /{}\u{258c}", f.query),
             2 + f.query.chars().count() + 1,
         ),
+        (Mode::Create, false) => (
+            format!(" {}", paint(DIM, &format!("/{}", f.query), color)),
+            2 + f.query.chars().count(),
+        ),
+        (Mode::Create, true) => (
+            format!(" {}", paint(DIM, "press / to search", color)),
+            1 + "press / to search".chars().count(),
+        ),
         (Mode::Normal, false) => (
             format!(" {}", paint(DIM, &format!("/{}", f.query), color)),
             2 + f.query.chars().count(),
@@ -883,11 +1025,12 @@ fn prompt_text(prompt: &Prompt) -> String {
 fn hints(mode: Mode) -> &'static str {
     match mode {
         Mode::Normal => {
-            "  /: search  \u{b7}  space: mark  \u{b7}  d: delete  \u{b7}  enter: select  \u{b7}  s: sort  \u{b7}  o: PR  \u{b7}  q: quit"
+            "  /: search  \u{b7}  n: new  \u{b7}  space: mark  \u{b7}  d: delete  \u{b7}  enter: select  \u{b7}  s: sort  \u{b7}  o: PR  \u{b7}  q: quit"
         }
         Mode::Search => {
             "  type to filter  \u{b7}  enter/esc: back to the list  \u{b7}  \u{2191}/\u{2193}: move"
         }
+        Mode::Create => "",
     }
 }
 
@@ -1326,6 +1469,8 @@ mod tests {
             marked,
             removing: NONE.get_or_init(HashSet::new),
             progress: "",
+            new_branch: "",
+            creating: &[],
             prompt: None,
             message: None,
         }

@@ -105,15 +105,36 @@ impl App {
             Msg::Prs(repo, result) => {
                 self.prs.insert(repo, result);
             }
-            // Removals are batched by the picker, which drops the rows itself
-            // once the whole batch has reported in.
-            Msg::Removed(..) => {}
+            // The picker handles these itself: it drops removed rows once a
+            // whole batch has reported, and rescans the repo after an add.
+            Msg::Removed(..) | Msg::Added(..) => {}
         }
     }
 
     /// Where to run `git worktree` commands affecting this worktree.
     pub fn repo_main(&self, wt: &Worktree) -> &Path {
         &self.repos[wt.repo].main_path
+    }
+
+    /// Re-read one repo's worktrees, after one was added.
+    ///
+    /// Status and age are keyed by path, so everything already loaded survives;
+    /// only the new row starts empty.
+    pub fn rescan_repo(&mut self, repo: usize) {
+        let Some(main_path) = self.repos.get(repo).map(|r| r.main_path.clone()) else {
+            return;
+        };
+        let Some(fresh) = git::relist(&main_path, repo) else {
+            return;
+        };
+        self.repos[repo] = fresh;
+        self.worktrees.retain(|wt| wt.repo != repo);
+        let mut refreshed = self.repos[repo].worktrees.clone();
+        refreshed.sort_by_key(|w| (!w.main, w.branch_label().to_lowercase()));
+        self.worktrees.extend(refreshed);
+        // Keep repos contiguous in the flat list, the way App::new built it.
+        self.worktrees
+            .sort_by_key(|w| (w.repo, !w.main, w.branch_label().to_lowercase()));
     }
 
     /// Drop worktrees that no longer exist, after removing them.

@@ -5,9 +5,9 @@
 Browse, search and prune them — a grove being the stand of trees around a repo.
 Each is annotated with the number of the open GitHub PR for its branch.
 
-On a TTY it opens an interactive picker — fuzzy search, multi-select, and
-deleting worktrees you are done with; piped, it prints tab-separated lines, so
-the same command works in a terminal and in a script.
+On a TTY it opens an interactive picker — fuzzy search, multi-select, creating
+worktrees and pruning the ones you are done with; piped, it prints
+tab-separated lines, so the same command works in a terminal and in a script.
 
 ```
  23 worktrees in ~/src/toolkit  ·  8 with an open PR
@@ -18,7 +18,7 @@ the same command works in a terminal and in a script.
  ● -        brogan/pickable-sampling-client          ↓12 ●1            5w  …/brogan/pickable-sampling-client
 
   modified 2 hours ago  ·  #42 (draft) feat(cache): real worker behind the broker
-  /: search  ·  space: mark  ·  d: delete  ·  enter: select  ·  s: sort  ·  o: PR  ·  q: quit
+  /: search  ·  n: new  ·  space: mark  ·  d: delete  ·  enter: select  ·  s: sort  ·  o: PR  ·  q: quit
 ```
 
 ## Install
@@ -54,6 +54,7 @@ the letters free for acting on the list.
 | Key | |
 | --- | --- |
 | `/` | open the fuzzy filter |
+| `n` | create a worktree for a branch you name |
 | `j` `k`, `↑` `↓`, `ctrl-p` `ctrl-n`, `PgUp` `PgDn`, `g` `G` | move |
 | `space` | mark the worktree under the cursor, and move down |
 | `a` | mark every listed worktree, or unmark them if they already are |
@@ -75,6 +76,24 @@ listed) the repo name, best match first, with the matched characters
 highlighted. Space-separated tokens all have to match, so `toolkit cache`
 narrows to cache branches in the toolkit repo, and `42` finds a worktree by its
 PR number.
+
+### Creating a worktree
+
+`n` asks for a branch name and makes a worktree for it. If the branch already
+exists it is checked out; otherwise it is created from whatever the repo's main
+worktree has checked out.
+
+The new worktree goes wherever that repo already keeps its worktrees — grove
+takes the directory most of the existing ones live in, so it follows whatever
+layout is already in use rather than imposing one. A repo with no worktrees yet
+gets a `<repo>-worktrees/` directory beside it, rather than one inside the repo
+where it would show up as untracked in every `git status`. A `/` in the branch
+name becomes `+` in the directory name, since a `/` would nest instead.
+
+The checkout runs in the background — it is a full checkout, seconds on a large
+repo — so the list keeps drawing and taking keys while it happens. When it
+lands, the new worktree is selected, and the filter is cleared if it would have
+hidden it.
 
 ### Deleting worktrees
 
