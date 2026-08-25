@@ -1,8 +1,9 @@
 # grove
 
-Browse, search and prune the git worktrees of a repo — a grove being the stand
-of trees around it. Each is annotated with the number of the open GitHub PR for
-its branch.
+> *Take a stroll through your git worktrees.*
+
+Browse, search and prune them — a grove being the stand of trees around a repo.
+Each is annotated with the number of the open GitHub PR for its branch.
 
 On a TTY it opens an interactive picker — fuzzy search, multi-select, and
 deleting worktrees you are done with; piped, it prints tab-separated lines, so
