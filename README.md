@@ -228,3 +228,7 @@ error, `2` bad usage, `130` `--pick` cancelled, so nothing was printed.
   of modified files, not a time.
 - Status reads pass `--no-optional-locks`, so listing worktrees never refreshes
   an index and never disturbs the timestamps it is reporting.
+- `--version` names the commit the binary came from — `grove 0.1.0 (58cab722)`,
+  with a `-dirty` suffix when the checkout had uncommitted changes to tracked
+  files. Built from a source tarball rather than a checkout there is no commit
+  to name, and it prints the bare `grove 0.1.0`.

@@ -47,7 +47,7 @@ OPTIONS:
                     (the picker always loads it, lazily)
         --no-pr     skip the GitHub PR lookup
     -h, --help      print this help
-    -V, --version   print the version
+    -V, --version   print the version, and the commit it was built from
 
 EXIT CODES:
     0  listed, or the picker was left
@@ -113,7 +113,7 @@ fn parse_args() -> Result<Option<Opts>, String> {
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("grove {}", env!("CARGO_PKG_VERSION"));
+                println!("grove {}", version());
                 return Ok(None);
             }
             "-j" | "--json" => opts.json = true,
@@ -142,6 +142,15 @@ fn parse_args() -> Result<Option<Opts>, String> {
         return Err("--sort needs one of: name, recent, oldest".to_string());
     }
     Ok(Some(opts))
+}
+
+/// The semver, plus the commit it was built from when there was one to name:
+/// `0.1.0 (58cab72d)`, or `0.1.0 (58cab72d-dirty)` from a modified checkout.
+fn version() -> String {
+    match option_env!("GROVE_COMMIT") {
+        Some(commit) => format!("{} ({commit})", env!("CARGO_PKG_VERSION")),
+        None => env!("CARGO_PKG_VERSION").to_string(),
+    }
 }
 
 fn main() -> ExitCode {
