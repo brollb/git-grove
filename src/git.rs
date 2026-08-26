@@ -1,6 +1,6 @@
 //! Discovering and inspecting git worktrees by shelling out to `git`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -89,37 +89,19 @@ fn git_result(dir: &Path, args: &[&str]) -> Result<String, String> {
     Err(reason)
 }
 
-/// Where this repo keeps its linked worktrees: wherever most of them already
-/// live, so a new one lands beside its siblings whatever layout is in use.
+/// Where grove puts the worktrees it creates: `.grove/` inside the repo.
 ///
-/// With no linked worktrees to learn from, they go in a directory next to the
-/// repo rather than inside it, where an untracked directory would show up in
-/// every `git status`.
+/// One fixed convention rather than a guess at the layout already in use — a
+/// guess is right until it is not, and being able to say where a worktree will
+/// land before you press `n` is worth more than matching whatever an existing
+/// pile of worktrees happens to do. Worktrees grove did not create are listed
+/// wherever they are; only new ones go here.
 pub fn worktree_home(repo: &Repo) -> PathBuf {
-    let mut counts: HashMap<&Path, usize> = HashMap::new();
-    for wt in repo.worktrees.iter().filter(|w| !w.main) {
-        if let Some(parent) = wt.path.parent() {
-            *counts.entry(parent).or_default() += 1;
-        }
-    }
-    // Ties break towards the shallower path, so the answer is stable rather
-    // than dependent on hash order.
-    if let Some((parent, _)) = counts
-        .iter()
-        .max_by_key(|(parent, n)| (**n, std::cmp::Reverse(parent.components().count())))
-    {
-        return parent.to_path_buf();
-    }
-    let name = repo
-        .main_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "repo".to_string());
-    match repo.main_path.parent() {
-        Some(parent) => parent.join(format!("{name}-worktrees")),
-        None => repo.main_path.join(".worktrees"),
-    }
+    repo.main_path.join(WORKTREE_HOME)
 }
+
+/// The directory `worktree_home` names, relative to the repo.
+pub const WORKTREE_HOME: &str = ".grove";
 
 /// A branch name as a directory name: `/` would nest, so it is folded to `+`,
 /// which is what the worktree tooling here already produces.
@@ -127,10 +109,38 @@ pub fn worktree_dir_name(branch: &str) -> String {
     branch.trim().trim_matches('/').replace('/', "+")
 }
 
+/// Keep `.grove/` out of `git status`. The worktrees live inside the repo now,
+/// so without this the first one turns the repo permanently dirty-looking.
+///
+/// It goes in `.git/info/exclude`, which is local to the clone: what a repo
+/// tracks in its `.gitignore` is the repo's business, not grove's. Anything
+/// that already ignores the directory is left alone.
+fn exclude_worktree_home(repo_main: &Path) {
+    // check-ignore exits 0 only when the path is already ignored.
+    if git(repo_main, &["check-ignore", "-q", WORKTREE_HOME]).is_some() {
+        return;
+    }
+    let Some(exclude) = common_dir(repo_main).map(|d| d.join("info").join("exclude")) else {
+        return;
+    };
+    let mut current = fs::read_to_string(&exclude).unwrap_or_default();
+    if !current.is_empty() && !current.ends_with('\n') {
+        current.push('\n');
+    }
+    // Anchored, so it only ever matches the one at the top of the repo.
+    current.push_str(&format!("/{WORKTREE_HOME}/\n"));
+    if let Some(dir) = exclude.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(&exclude, current);
+}
+
 /// Create a worktree for `branch`, making the branch if it does not exist yet.
 ///
-/// A new branch starts from whatever the repo's main worktree has checked out.
+/// A new branch starts from whatever the repo's main worktree has checked out,
+/// and the first worktree also gets `.grove/` excluded locally.
 pub fn add_worktree(repo_main: &Path, path: &Path, branch: &str) -> Result<(), String> {
+    exclude_worktree_home(repo_main);
     let existing = git(
         repo_main,
         &[
@@ -525,7 +535,15 @@ prunable gitdir file points to non-existent location
     }
 
     #[test]
-    fn new_worktrees_follow_the_layout_already_in_use() {
+    fn new_worktrees_go_in_the_repos_grove_directory() {
+        let repo = repo_with("/src/repo", &[]);
+        assert_eq!(worktree_home(&repo), PathBuf::from("/src/repo/.grove"));
+    }
+
+    #[test]
+    fn existing_worktrees_elsewhere_do_not_move_the_target() {
+        // Whatever layout a repo already has, a new worktree still lands in
+        // .grove/ — that is the point of a convention.
         let repo = repo_with(
             "/src/repo",
             &[
@@ -534,19 +552,7 @@ prunable gitdir file points to non-existent location
                 "/elsewhere/three",
             ],
         );
-        assert_eq!(
-            worktree_home(&repo),
-            PathBuf::from("/src/repo/.claude/worktrees"),
-            "the majority layout wins over the one-off"
-        );
-    }
-
-    #[test]
-    fn with_no_worktrees_to_learn_from_they_go_beside_the_repo() {
-        // Never inside the repo, where an untracked directory would turn up in
-        // every `git status`.
-        let repo = repo_with("/src/repo", &[]);
-        assert_eq!(worktree_home(&repo), PathBuf::from("/src/repo-worktrees"));
+        assert_eq!(worktree_home(&repo), PathBuf::from("/src/repo/.grove"));
     }
 
     #[test]
@@ -566,6 +572,24 @@ prunable gitdir file points to non-existent location
         assert!(path.join(".git").exists(), "a worktree lives there now");
         let branches = git(&root, &["branch", "--list", "brand-new"]).unwrap();
         assert!(branches.contains("brand-new"), "the branch was created");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_worktree_inside_the_repo_is_excluded_from_git_status() {
+        let (root, _) = scratch_repo("exclude");
+        let path = worktree_home(&repo_at(&root, 0).unwrap()).join("hidden");
+        assert_eq!(add_worktree(&root, &path, "hidden"), Ok(()));
+        let status = git(&root, &["status", "--porcelain"]).unwrap();
+        assert!(
+            !status.contains(WORKTREE_HOME),
+            "the worktree directory must not make the repo look dirty: {status:?}"
+        );
+
+        // Appending it a second time would be noise in the file.
+        add_worktree(&root, &path.with_file_name("second"), "second").expect("second worktree");
+        let exclude = std::fs::read_to_string(root.join(".git/info/exclude")).expect("exclude");
+        assert_eq!(exclude.matches(WORKTREE_HOME).count(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

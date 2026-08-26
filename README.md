@@ -83,12 +83,26 @@ PR number.
 exists it is checked out; otherwise it is created from whatever the repo's main
 worktree has checked out.
 
-The new worktree goes wherever that repo already keeps its worktrees — grove
-takes the directory most of the existing ones live in, so it follows whatever
-layout is already in use rather than imposing one. A repo with no worktrees yet
-gets a `<repo>-worktrees/` directory beside it, rather than one inside the repo
-where it would show up as untracked in every `git status`. A `/` in the branch
-name becomes `+` in the directory name, since a `/` would nest instead.
+New worktrees go in `.grove/` inside the repo, always:
+
+```
+~/src/toolkit/                     the repo
+~/src/toolkit/.grove/brogan+fix    a worktree for brogan/fix
+```
+
+One convention rather than a guess at the layout already in use, so you know
+where a worktree will land before you press `n`, and where to look for it
+afterwards. A `/` in the branch name becomes `+` in the directory name, since a
+`/` would nest instead.
+
+Worktrees made some other way are still listed wherever they are — the
+convention governs where grove *puts* things, not what it will show you.
+
+The first time grove creates a worktree in a repo it adds `/.grove/` to that
+repo's `.git/info/exclude`, so the worktrees do not turn up as untracked in
+every `git status`. That file is local to your clone; grove does not touch a
+tracked `.gitignore`, and a repo that already ignores the directory is left
+alone.
 
 The checkout runs in the background — it is a full checkout, seconds on a large
 repo — so the list keeps drawing and taking keys while it happens. When it
