@@ -29,7 +29,9 @@ fn main() {
     let Some(commit) = git(&["rev-parse", "--short=8", "HEAD"]) else {
         return; // a repo with no commits yet
     };
-    // Uncommitted tracked changes mean the binary is not the commit it names.
+    // Uncommitted changes mean the binary is not the commit it names. This sees
+    // what cargo re-runs the build script for — src/ and Cargo.toml, the things
+    // that end up in the binary — so an uncommitted README is not "dirty".
     let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
         .is_some_and(|out| !out.trim().is_empty());
     let suffix = if dirty { "-dirty" } else { "" };

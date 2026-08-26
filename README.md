@@ -229,6 +229,9 @@ error, `2` bad usage, `130` `--pick` cancelled, so nothing was printed.
 - Status reads pass `--no-optional-locks`, so listing worktrees never refreshes
   an index and never disturbs the timestamps it is reporting.
 - `--version` names the commit the binary came from — `grove 0.1.0 (58cab722)`,
-  with a `-dirty` suffix when the checkout had uncommitted changes to tracked
-  files. Built from a source tarball rather than a checkout there is no commit
-  to name, and it prints the bare `grove 0.1.0`.
+  with a `-dirty` suffix when the code it was built from had uncommitted
+  changes. The dirty check covers what goes into the binary (`src/`,
+  `Cargo.toml`), since that is what cargo re-runs the build script for; an
+  uncommitted README does not make a build dirty. Built from a source tarball
+  rather than a checkout there is no commit to name, and it prints the bare
+  `grove 0.1.0`.
