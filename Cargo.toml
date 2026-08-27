@@ -1,11 +1,11 @@
 [package]
-name = "grove"
+name = "git-grove"
 version = "0.1.0"
 edition = "2021"
 description = "Browse, search and prune the git worktrees of a repo"
 
 [[bin]]
-name = "grove"
+name = "git-grove"
 path = "src/main.rs"
 
 [dependencies]

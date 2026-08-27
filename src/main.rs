@@ -12,7 +12,7 @@ mod ui;
 
 use std::env;
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
@@ -20,10 +20,10 @@ use app::{display_path, App, PrCell, Sort};
 use load::Loader;
 
 const USAGE: &str = "\
-grove — browse, search and prune the git worktrees of a repo
+{name} — browse, search and prune the git worktrees of a repo
 
 USAGE:
-    grove [OPTIONS] [DIRECTORY]
+    {name} [OPTIONS] [DIRECTORY]
 
 DIRECTORY defaults to the current directory. If it is inside a git repo, that
 repo's worktrees are listed; otherwise every repo directly beneath it is scanned.
@@ -39,7 +39,7 @@ OPTIONS:
     -S, --sort S    order the list: name (default), recent, oldest
     -p, --pick      make enter print the selected path to stdout and exit,
                     instead of opening a shell; works when stdout is redirected
-                        cd \"$(grove --pick)\"
+                        cd \"$({name} --pick)\"
         --plain     force tab-separated output:
                         path <TAB> branch <TAB> head <TAB> pr <TAB> flags
     -j, --json      JSON output
@@ -55,6 +55,30 @@ EXIT CODES:
     2  bad usage
   130  --pick was cancelled, so nothing was printed
 ";
+
+/// How to name the tool back to the user. Installed as `git-grove`, it is
+/// reached as `git grove`, which is what the help should say — whichever of the
+/// two was typed, since git execs it under its own name either way.
+fn program() -> String {
+    program_name(&env::args().next().unwrap_or_default())
+}
+
+fn program_name(arg0: &str) -> String {
+    // argv[0] is not guaranteed to be anything; the normal way in is the one
+    // worth naming when it tells us nothing.
+    let Some(name) = Path::new(arg0).file_name() else {
+        return "git grove".to_string();
+    };
+    let name = name.to_string_lossy();
+    match name.strip_prefix("git-") {
+        Some(sub) => format!("git {sub}"),
+        None => name.into_owned(),
+    }
+}
+
+fn usage() -> String {
+    USAGE.replace("{name}", &program())
+}
 
 struct Opts {
     dir: PathBuf,
@@ -109,11 +133,11 @@ fn parse_args() -> Result<Option<Opts>, String> {
         }
         match arg.as_str() {
             "-h" | "--help" => {
-                print!("{USAGE}");
+                print!("{}", usage());
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("grove {}", version());
+                println!("{} {}", program(), version());
                 return Ok(None);
             }
             "-j" | "--json" => opts.json = true,
@@ -158,7 +182,7 @@ fn main() -> ExitCode {
         Ok(Some(opts)) => opts,
         Ok(None) => return ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("grove: {err}\n\n{USAGE}");
+            eprintln!("{}: {err}\n\n{}", program(), usage());
             return ExitCode::from(2);
         }
     };
@@ -166,14 +190,14 @@ fn main() -> ExitCode {
     let dir = match std::fs::canonicalize(&opts.dir) {
         Ok(dir) => dir,
         Err(err) => {
-            eprintln!("grove: {}: {err}", opts.dir.display());
+            eprintln!("{}: {}: {err}", program(), opts.dir.display());
             return ExitCode::from(1);
         }
     };
 
     let repos = git::discover(&dir);
     if repos.is_empty() {
-        eprintln!("grove: no git worktrees found in {}", dir.display());
+        eprintln!("{}: no git worktrees found in {}", program(), dir.display());
         return ExitCode::from(1);
     }
 
@@ -205,7 +229,7 @@ fn main() -> ExitCode {
             }
             Ok(None) => ExitCode::from(130),
             Err(err) => {
-                eprintln!("grove: {err}");
+                eprintln!("{}: {err}", program());
                 ExitCode::from(1)
             }
         };
@@ -232,7 +256,7 @@ fn main() -> ExitCode {
     while outstanding > 0 {
         let now = Instant::now();
         if now >= deadline {
-            eprintln!("grove: timed out waiting for status/PR data");
+            eprintln!("{}: timed out waiting for status/PR data", program());
             break;
         }
         match rx.recv_timeout(deadline - now) {
@@ -241,7 +265,7 @@ fn main() -> ExitCode {
                 outstanding -= 1;
             }
             Err(_) => {
-                eprintln!("grove: timed out waiting for status/PR data");
+                eprintln!("{}: timed out waiting for status/PR data", program());
                 break;
             }
         }
@@ -275,13 +299,13 @@ fn shell_loop(
             Ok(Some(path)) => path,
             Ok(None) => return ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("grove: {err}");
+                eprintln!("{}: {err}", program());
                 return ExitCode::from(1);
             }
         };
         eprintln!("\x1b[90m\u{2192} {}\x1b[0m", path.display());
         if let Err(err) = Command::new(&shell).current_dir(&path).status() {
-            eprintln!("grove: {shell} in {}: {err}", path.display());
+            eprintln!("{}: {shell} in {}: {err}", program(), path.display());
         }
         // Whatever happened in there, the worktree's status is now suspect.
         app.statuses.remove(&path);
@@ -402,4 +426,28 @@ fn print_json(app: &App, selection: &[usize], with_status: bool) {
         "{}",
         serde_json::to_string_pretty(&items).unwrap_or_default()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_git_subcommand_names_itself_the_way_it_is_reached() {
+        assert_eq!(program_name("/usr/local/bin/git-grove"), "git grove");
+        assert_eq!(program_name("git-grove"), "git grove");
+        // Linked under a shorter name, it answers to that instead.
+        assert_eq!(program_name("/usr/local/bin/grove"), "grove");
+        // With no argv[0] to go on, the normal way in is the one to name.
+        assert_eq!(program_name(""), "git grove");
+    }
+
+    #[test]
+    fn the_help_text_carries_that_name_rather_than_a_literal() {
+        assert!(
+            !usage().contains("{name}"),
+            "every placeholder is filled in"
+        );
+        assert!(usage().contains(&program()));
+    }
 }

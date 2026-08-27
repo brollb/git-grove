@@ -27,19 +27,26 @@ tab-separated lines, so the same command works in a terminal and in a script.
 cargo install --path .
 ```
 
-That puts `grove` on your `PATH`. For it to double as a git subcommand, link it
-under the name git looks for:
+That puts `git-grove` on your `PATH`, which is the name git looks for, so it is
+a git subcommand as soon as it is installed:
 
 ```sh
-ln -s "$(command -v grove)" ~/.cargo/bin/git-grove   # then: git grove
+git grove
+```
+
+If you would rather type it as one word, link it under a shorter name — it
+answers to whatever it is invoked as, so the help and the errors follow:
+
+```sh
+ln -s "$(command -v git-grove)" ~/.cargo/bin/grove   # then: grove
 ```
 
 ## Usage
 
 ```sh
-grove                  # worktrees of the repo you are standing in
-grove ~/src            # a directory of repos: every repo beneath it
-grove --json | jq .    # machine-readable
+git grove                  # worktrees of the repo you are standing in
+git grove ~/src            # a directory of repos: every repo beneath it
+git grove --json | jq .    # machine-readable
 ```
 
 `DIRECTORY` defaults to the current directory. If it is inside a git repo, that
@@ -173,7 +180,7 @@ prints the selected path to stdout and exits, with the list still drawn on
 `/dev/tty` so it stays out of the way of a redirect:
 
 ```sh
-wt() { cd "$(grove --pick "$@")" || return; }
+wt() { cd "$(git grove --pick "$@")" || return; }
 ```
 
 Cancelling exits 130 with nothing on stdout, so `cd` is left alone.
@@ -228,10 +235,10 @@ error, `2` bad usage, `130` `--pick` cancelled, so nothing was printed.
   of modified files, not a time.
 - Status reads pass `--no-optional-locks`, so listing worktrees never refreshes
   an index and never disturbs the timestamps it is reporting.
-- `--version` names the commit the binary came from — `grove 0.1.0 (58cab722)`,
-  with a `-dirty` suffix when the code it was built from had uncommitted
-  changes. The dirty check covers what goes into the binary (`src/`,
+- `--version` names the commit the binary came from — `git grove 0.1.0
+  (58cab722)`, with a `-dirty` suffix when the code it was built from had
+  uncommitted changes. The dirty check covers what goes into the binary (`src/`,
   `Cargo.toml`), since that is what cargo re-runs the build script for; an
   uncommitted README does not make a build dirty. Built from a source tarball
   rather than a checkout there is no commit to name, and it prints the bare
-  `grove 0.1.0`.
+  `git grove 0.1.0`.
