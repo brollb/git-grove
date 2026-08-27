@@ -1,4 +1,4 @@
-# grove
+# git grove
 
 > *Take a stroll through your git worktrees.*
 
