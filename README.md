@@ -1,5 +1,7 @@
 # grove
 
+**Disclaimer**: This is a vibe coded tool that I made to make my day-to-day easier. I haven't vetted the code quality but wanted to share in case others found it useful, too.
+
 > *Take a stroll through your git worktrees.*
 
 Browse, search and prune them — a grove being the stand of trees around a repo.
