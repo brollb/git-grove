@@ -1,4 +1,4 @@
-# grove
+# git grove
 
 **Disclaimer**: This is a vibe coded tool that I made to make my day-to-day easier. I haven't vetted the code quality but wanted to share in case others found it useful, too.
 
