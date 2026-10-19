@@ -736,6 +736,7 @@ fn size() -> (usize, usize) {
 struct Widths {
     pr: usize,
     branch: usize,
+    commit: usize,
     status: usize,
     age: usize,
     path: usize,
@@ -743,9 +744,10 @@ struct Widths {
 
 fn widths(app: &App, total: usize) -> Widths {
     let pr = 7;
+    let commit = 8;
     let status = 14;
     let age = 5;
-    let fixed = 3 + pr + 2 + status + 2 + age + 2 + 2; // gutter + gaps
+    let fixed = 3 + pr + 2 + commit + 2 + status + 2 + age + 2 + 2; // gutter + gaps
     let flex = total.saturating_sub(fixed).max(20);
     let longest = app
         .worktrees
@@ -757,6 +759,7 @@ fn widths(app: &App, total: usize) -> Widths {
     Widths {
         pr,
         branch,
+        commit,
         status,
         age,
         path: flex.saturating_sub(branch).max(8),
@@ -824,9 +827,10 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
             DIM,
             &fit(
                 &format!(
-                    "   {}  {}  {}  {}  {}",
+                    "   {}  {}  {}  {}  {}  {}",
                     fit("PR", w.pr),
                     fit("BRANCH", w.branch),
+                    fit("COMMIT", w.commit),
                     fit("STATUS", w.status),
                     fit_right("AGE", w.age),
                     "PATH"
@@ -858,6 +862,7 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
                     fit(&status_text(status, wt.locked, wt.prunable), w.status)
                 };
                 let age_cell = fit_right(&age_text(status, now), w.age);
+                let commit_cell = fit(&commit_text(wt), w.commit);
                 let branch = wt.branch_label();
                 let path = crate::app::display_path(&wt.path, Some(&app.root));
                 let marked = f.marked.contains(&wt.path);
@@ -872,7 +877,7 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
                     // their resets) can't punch holes in the highlight.
                     let plain = fit(
                         &format!(
-                            "{marker}{pr_cell}  {}  {status_cell}  {age_cell}  {}",
+                            "{marker}{pr_cell}  {}  {commit_cell}  {status_cell}  {age_cell}  {}",
                             fit(&branch, w.branch),
                             fit_tail(&path, w.path)
                         ),
@@ -886,9 +891,10 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
                         marker.clone()
                     };
                     let styled = format!(
-                        "{marker}{}  {}  {}  {}  {}",
+                        "{marker}{}  {}  {}  {}  {}  {}",
                         paint(pr_color(app.pr_for(wt)), &pr_cell, true),
                         fit_hl(&branch, w.branch, &hits.branch, false, ""),
+                        paint(DIM, &commit_cell, true),
                         paint(status_color(status, wt.prunable), &status_cell, true),
                         paint(DIM, &age_cell, true),
                         fit_hl(&path, w.path, &hits.path, true, DIM),
@@ -897,7 +903,7 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
                 } else {
                     let plain = fit(
                         &format!(
-                            "{marker}{pr_cell}  {}  {status_cell}  {age_cell}  {}",
+                            "{marker}{pr_cell}  {}  {commit_cell}  {status_cell}  {age_cell}  {}",
                             fit(&branch, w.branch),
                             fit_tail(&path, w.path)
                         ),
@@ -1075,6 +1081,17 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// The short hash of the worktree's checked-out commit; `-` when there is
+/// none (a bare repo, or one with no commits yet).
+fn commit_text(wt: &git::Worktree) -> String {
+    // An unborn branch is reported as the all-zero hash.
+    if wt.head.chars().all(|c| c == '0') {
+        "-".to_string()
+    } else {
+        git::short_sha(&wt.head)
+    }
 }
 
 fn age_text(status: Option<&Status>, now: u64) -> String {

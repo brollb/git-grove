@@ -307,9 +307,18 @@ fn shell_loop(
         if let Err(err) = Command::new(&shell).current_dir(&path).status() {
             eprintln!("{}: {shell} in {}: {err}", program(), path.display());
         }
-        // Whatever happened in there, the worktree's status is now suspect.
+        // Whatever happened in there, the worktree's status is now suspect,
+        // and so is its commit (and even its branch).
         app.statuses.remove(&path);
         loader.forget(&path);
+        if let Some(repo) = app
+            .worktrees
+            .iter()
+            .find(|wt| wt.path == path)
+            .map(|wt| wt.repo)
+        {
+            app.rescan_repo(repo);
+        }
     }
 }
 

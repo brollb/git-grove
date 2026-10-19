@@ -13,11 +13,11 @@ tab-separated lines, so the same command works in a terminal and in a script.
 
 ```
  23 worktrees in ~/src/toolkit  ·  8 with an open PR
- /cache worker                                              2 marked  ·  3/23
-   PR       BRANCH                                   STATUS          AGE  PATH
-▸  #42      brogan/cache-worker                      ↑3                2h  …/brogan+cache-worker
- ● #57      brogan/cache-worker-drop-storage-dir     clean             3d  …/cache-harness-fixes
- ● -        brogan/pickable-sampling-client          ↓12 ●1            5w  …/brogan/pickable-sampling-client
+ /cache worker                                                        2 marked  ·  3/23
+   PR       BRANCH                                   COMMIT    STATUS          AGE  PATH
+▸  #42      brogan/cache-worker                      3f9a1c2e  ↑3                2h  …/brogan+cache-worker
+ ● #57      brogan/cache-worker-drop-storage-dir     a07d55b1  clean             3d  …/cache-harness-fixes
+ ● -        brogan/pickable-sampling-client          e41c0d98  ↓12 ●1            5w  …/brogan/pickable-sampling-client
 
   modified 2 hours ago  ·  #42 (draft) feat(cache): real worker behind the broker
   /: search  ·  n: new  ·  space: mark  ·  d: delete  ·  enter: open  ·  s: sort  ·  o: PR  ·  q: quit
