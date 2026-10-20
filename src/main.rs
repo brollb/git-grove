@@ -215,8 +215,11 @@ fn main() -> ExitCode {
             loader.spawn_prs(
                 i,
                 repo.main_path.clone(),
+                // The main worktree's branch is where PRs land, not where they
+                // come from; a fork's PR from its own `main` would match it.
                 repo.worktrees
                     .iter()
+                    .filter(|w| !w.main)
                     .filter_map(|w| w.branch.clone())
                     .collect(),
             );
@@ -335,7 +338,7 @@ fn print_plain(app: &App, selection: &[usize], with_status: bool) {
     let mut out = stdout.lock();
     for wt in selection.iter().map(|&i| &app.worktrees[i]) {
         let pr = match app.pr_for(wt) {
-            PrCell::Open(pr) => format!("#{}", pr.number),
+            PrCell::Found(pr) => format!("#{}", pr.number),
             _ => "-".to_string(),
         };
         let mut flags = Vec::new();
@@ -354,9 +357,12 @@ fn print_plain(app: &App, selection: &[usize], with_status: bool) {
         if wt.prunable {
             flags.push("prunable".to_string());
         }
-        if let PrCell::Open(pr) = app.pr_for(wt) {
+        if let PrCell::Found(pr) = app.pr_for(wt) {
             if pr.draft {
                 flags.push("draft".to_string());
+            }
+            if pr.merged {
+                flags.push("merged".to_string());
             }
             if let Some(ci) = pr.ci {
                 if let Some(state) = checks_state(&ci.checks) {
@@ -450,11 +456,12 @@ fn print_json(app: &App, selection: &[usize], with_status: bool) {
                 "locked": wt.locked,
                 "prunable": wt.prunable,
                 "pr": match app.pr_for(wt) {
-                    PrCell::Open(pr) => serde_json::json!({
+                    PrCell::Found(pr) => serde_json::json!({
                         "number": pr.number,
                         "draft": pr.draft,
                         "title": pr.title,
                         "url": pr.url,
+                        "merged": pr.merged,
                         "checks": pr.ci.map(|ci| serde_json::json!({
                             "state": checks_state(&ci.checks),
                             "passed": ci.checks.passed,

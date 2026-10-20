@@ -19,6 +19,7 @@ use crate::load::{Loader, Msg};
 const RESET: &str = "\x1b[0m";
 const CYAN: &str = "36";
 const MAGENTA: &str = "35";
+const BLUE: &str = "34";
 const YELLOW: &str = "33";
 const GREEN: &str = "32";
 const RED: &str = "31";
@@ -379,7 +380,7 @@ pub fn run(
                             }
                             KeyCode::Char('o') => {
                                 if let Some(Row::Item(i, _)) = rows.get(sel) {
-                                    if let PrCell::Open(pr) = app.pr_for(&app.worktrees[*i]) {
+                                    if let PrCell::Found(pr) = app.pr_for(&app.worktrees[*i]) {
                                         gh::open_url(&pr.url);
                                     }
                                 }
@@ -796,11 +797,14 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
     buf.push_str("\x1b[H"); // home
 
     let total = app.worktrees.len();
-    let with_prs = app
-        .worktrees
-        .iter()
-        .filter(|wt| matches!(app.pr_for(wt), PrCell::Open(_)))
-        .count();
+    let (mut with_prs, mut merged) = (0, 0);
+    for wt in &app.worktrees {
+        match app.pr_for(wt) {
+            PrCell::Found(pr) if pr.merged => merged += 1,
+            PrCell::Found(_) => with_prs += 1,
+            _ => {}
+        }
+    }
     let sort_note = if app.sort == Sort::Name {
         String::new()
     } else {
@@ -817,7 +821,12 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
         if total == 1 { "" } else { "s" },
         crate::app::display_path(&app.root, None),
         if app.want_prs {
-            format!("  ·  {with_prs} with an open PR")
+            let merged = if merged > 0 {
+                format!("  ·  {merged} merged")
+            } else {
+                String::new()
+            };
+            format!("  ·  {with_prs} with an open PR{merged}")
         } else {
             String::new()
         },
@@ -1071,10 +1080,16 @@ fn detail_text(app: &App, i: usize, now: u64) -> String {
         parts.push(base_phrase(base));
     }
     parts.push(match app.pr_for(wt) {
-        PrCell::Open(pr) => format!(
+        PrCell::Found(pr) => format!(
             "#{}{} {}",
             pr.number,
-            if pr.draft { " (draft)" } else { "" },
+            if pr.merged {
+                " (merged)"
+            } else if pr.draft {
+                " (draft)"
+            } else {
+                ""
+            },
             pr.title
         ),
         PrCell::Loading => "looking up pull requests\u{2026}".to_string(),
@@ -1082,7 +1097,12 @@ fn detail_text(app: &App, i: usize, now: u64) -> String {
         PrCell::None if app.want_prs => "no open PR for this branch".to_string(),
         PrCell::None => crate::git::short_sha(&wt.head),
     });
-    if let PrCell::Open(pr) = app.pr_for(wt) {
+    if let PrCell::Found(pr) = app.pr_for(wt) {
+        // Commits made after the merge, or a merge of commits made elsewhere:
+        // either way, what is here is not exactly what landed.
+        if pr.merged && !pr.head_oid.is_empty() && pr.head_oid != wt.head {
+            parts.push("HEAD differs from what was merged".to_string());
+        }
         match (pr.ci, app.ci_errors.get(&wt.repo)) {
             (Some(ci), _) => {
                 parts.extend(checks_phrase(&ci.checks));
@@ -1176,7 +1196,7 @@ fn age_phrase(now: u64, then: u64) -> String {
 
 fn pr_text(cell: PrCell) -> String {
     match cell {
-        PrCell::Open(pr) => match pr.ci.and_then(|ci| checks_glyph(&ci.checks)) {
+        PrCell::Found(pr) => match pr_glyph(pr) {
             Some((glyph, _)) => format!("#{} {glyph}", pr.number),
             None => format!("#{}", pr.number),
         },
@@ -1185,14 +1205,14 @@ fn pr_text(cell: PrCell) -> String {
     }
 }
 
-/// The PR cell in color: the number in the PR's color, the CI glyph in its own.
+/// The PR cell in color: the number in the PR's color, the glyph in its own.
 fn pr_styled(cell: PrCell, w: usize) -> String {
     let text = fit(&pr_text(cell), w);
-    let PrCell::Open(pr) = cell else {
+    let PrCell::Found(pr) = cell else {
         return paint(pr_color(cell), &text, true);
     };
     let number = format!("#{}", pr.number);
-    match pr.ci.and_then(|ci| checks_glyph(&ci.checks)) {
+    match pr_glyph(pr) {
         // Only split the cell when it fits whole; a truncated one stays plain.
         Some((glyph, color)) if text.trim_end() == format!("{number} {glyph}") => {
             let pad = &text[text.trim_end().len()..];
@@ -1204,6 +1224,15 @@ fn pr_styled(cell: PrCell, w: usize) -> String {
         }
         _ => paint(pr_color(cell), &text, true),
     }
+}
+
+/// The mark after a PR's number: `◆` once it has merged, and until then how
+/// its CI is doing.
+fn pr_glyph(pr: &gh::Pr) -> Option<(&'static str, &'static str)> {
+    if pr.merged {
+        return Some(("\u{25c6}", BLUE));
+    }
+    pr.ci.and_then(|ci| checks_glyph(&ci.checks))
 }
 
 /// CI at a glance: `✓` passing, `✗` failing, `●` still running.
@@ -1271,8 +1300,10 @@ fn base_phrase(base: &Divergence) -> String {
 
 fn pr_color(cell: PrCell) -> &'static str {
     match cell {
-        PrCell::Open(pr) if pr.draft => MAGENTA,
-        PrCell::Open(_) => CYAN,
+        // Done with: it no longer needs the eye an open PR does.
+        PrCell::Found(pr) if pr.merged => DIM,
+        PrCell::Found(pr) if pr.draft => MAGENTA,
+        PrCell::Found(_) => CYAN,
         _ => DIM,
     }
 }
@@ -1839,6 +1870,8 @@ mod tests {
                 checks,
                 review: gh::Review::None,
             }),
+            merged: false,
+            head_oid: String::new(),
         }
     }
 
@@ -1849,13 +1882,13 @@ mod tests {
             failed: 1,
             pending: 2,
         });
-        assert_eq!(pr_text(PrCell::Open(&failing)), "#42 \u{2717}");
+        assert_eq!(pr_text(PrCell::Found(&failing)), "#42 \u{2717}");
         assert_eq!(
             checks_phrase(&failing.ci.unwrap().checks).as_deref(),
             Some("1 of 8 checks failing")
         );
         let unchecked = pr(Checks::default());
-        assert_eq!(pr_text(PrCell::Open(&unchecked)), "#42");
+        assert_eq!(pr_text(PrCell::Found(&unchecked)), "#42");
         assert_eq!(checks_phrase(&unchecked.ci.unwrap().checks), None);
     }
 
@@ -1866,9 +1899,20 @@ mod tests {
             failed: 0,
             pending: 0,
         });
-        let cell = PrCell::Open(&passing);
+        let cell = PrCell::Found(&passing);
         assert_eq!(visible(&pr_styled(cell, 9)), fit(&pr_text(cell), 9));
         // Too narrow to split: truncated, and still the right width.
         assert_eq!(visible(&pr_styled(cell, 3)).chars().count(), 3);
+    }
+
+    #[test]
+    fn a_merged_pr_is_marked_as_merged_whatever_its_ci_said() {
+        let mut merged = pr(Checks {
+            passed: 0,
+            failed: 3,
+            pending: 0,
+        });
+        merged.merged = true;
+        assert_eq!(pr_text(PrCell::Found(&merged)), "#42 \u{25c6}");
     }
 }

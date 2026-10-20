@@ -12,12 +12,12 @@ worktrees and pruning the ones you are done with; piped, it prints
 tab-separated lines, so the same command works in a terminal and in a script.
 
 ```
- 23 worktrees in ~/src/toolkit  ·  8 with an open PR
+ 23 worktrees in ~/src/toolkit  ·  8 with an open PR  ·  3 merged
  /cache worker                                                                   2 marked  ·  3/23
    PR         BRANCH                                   COMMIT    VS MAIN    STATUS          AGE  PATH
 ▸  #42 ✓      brogan/cache-worker                      3f9a1c2e  +3 −12     ↑3                2h  …/brogan+cache-worker
  ● #57 ✗      brogan/cache-worker-drop-storage-dir     a07d55b1  +5 −140    clean             3d  …/cache-harness-fixes
- ● -          brogan/pickable-sampling-client          e41c0d98  −2k        ↓12 ●1            5w  …/brogan/pickable-sampling-client
+ ● #31 ◆      brogan/pickable-sampling-client          e41c0d98  −2k        ↓12 ●1            5w  …/brogan/pickable-sampling-client
 
   modified 2 hours ago  ·  3 ahead of, 12 behind origin/main  ·  #42 (draft) feat(cache): real worker behind the broker  ·  checks passing  ·  approved
   /: search  ·  n: new  ·  space: mark  ·  d: delete  ·  enter: open  ·  s: sort  ·  o: PR  ·  q: quit
@@ -210,6 +210,12 @@ error, `2` bad usage, `130` `--pick` cancelled, so nothing was printed.
   when nothing ran. The selected row spells out the title, draft state, how
   many checks failed or are still running, and the review decision (approved,
   changes requested, review required).
+
+  A branch with no open PR but a merged one shows that, dimmed, marked `◆` — the
+  worktree is probably done with. This catches squash merges, which VS MAIN
+  cannot: a squash-merged branch still looks ahead of main there. If the
+  worktree's HEAD is not the commit that was merged, the selected row says so,
+  since there may be work here that never landed.
 - **COMMIT** — the short hash of the commit the worktree has checked out.
 - **VS MAIN** — commits ahead of (`+`) and behind (`−`) the repo's main branch,
   `even` when level with it, `-` when there is no main branch to compare
@@ -240,6 +246,10 @@ error, `2` bad usage, `130` `--pick` cancelled, so nothing was printed.
   open PR is enough to make GitHub time out on a busy repo, which would take
   the PR numbers down with it. If the CI request fails, the PR column still
   shows, without the marks, and the reason is shown under the list.
+- Merged PRs are looked up in the same request, by branch, for only the
+  worktrees with no open PR — a repo's merged PRs are too many to list. The
+  main worktree's branch is never matched to a merged PR, since PRs land on it
+  rather than come from it.
 - Branch names are matched against PR head branches allowing for the Claude Code
   worktree convention: `worktree-brogan+fix` is pushed as `brogan/fix`.
 - In the picker, `git status` is only run for the rows on screen, so a
@@ -252,6 +262,8 @@ error, `2` bad usage, `130` `--pick` cancelled, so nothing was printed.
 - `--plain` reports the age as `mtime=<unix seconds>` among the flags, and
   `--json` as `status.last_modified`; `status.modified` next to it is the count
   of modified files, not a time.
+- A merged PR is flagged `merged` in `--plain` and has `pr.merged` set in
+  `--json`.
 - CI shows up in `--plain` flags as `checks=pass|fail|pending` and
   `review=approved|changes_requested|required`, and in `--json` as `pr.checks`
   (the verdict plus passed/failed/pending counts) and `pr.review`. With

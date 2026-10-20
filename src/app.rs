@@ -53,9 +53,10 @@ impl Sort {
 pub enum PrCell<'a> {
     /// Still waiting on `gh`.
     Loading,
-    /// No open PR for this branch.
+    /// No PR for this branch, open or merged.
     None,
-    Open(&'a Pr),
+    /// The branch's open PR — or, when it has none open, its merged one.
+    Found(&'a Pr),
     /// PR data could not be fetched (no `gh`, not a GitHub remote, ...).
     Unavailable(&'a str),
 }
@@ -68,7 +69,8 @@ pub struct App {
     pub ages: HashMap<PathBuf, Option<u64>>,
     pub sort: Sort,
     pub prs: HashMap<usize, Result<HashMap<String, Pr>, String>>,
-    /// Why CI could not be looked up, per repo. The PRs themselves still show.
+    /// Why CI and merged PRs could not be looked up, per repo. The open PRs
+    /// themselves still show.
     pub ci_errors: HashMap<usize, String>,
     pub root: PathBuf,
     pub want_prs: bool,
@@ -108,14 +110,19 @@ impl App {
             Msg::Prs(repo, result) => {
                 self.prs.insert(repo, result);
             }
-            Msg::Ci(repo, Ok(found)) => {
+            Msg::Details(repo, Ok(details)) => {
                 if let Some(Ok(by_branch)) = self.prs.get_mut(&repo) {
                     for pr in by_branch.values_mut() {
-                        pr.ci = found.get(&pr.number).copied();
+                        pr.ci = details.ci.get(&pr.number).copied();
+                    }
+                    // Merged PRs sit alongside the open ones, so every lookup
+                    // by branch finds them; an open PR still wins its branch.
+                    for (branch, pr) in details.merged {
+                        by_branch.entry(branch).or_insert(pr);
                     }
                 }
             }
-            Msg::Ci(repo, Err(why)) => {
+            Msg::Details(repo, Err(why)) => {
                 self.ci_errors.insert(repo, why);
             }
             // The picker handles these itself: it drops removed rows once a
@@ -194,7 +201,7 @@ impl App {
                 let branch = wt.branch_label();
                 let path = display_path(&wt.path, Some(&self.root));
                 let pr = match self.pr_for(wt) {
-                    PrCell::Open(pr) => Some(format!("#{}", pr.number)),
+                    PrCell::Found(pr) => Some(format!("#{}", pr.number)),
                     _ => None,
                 };
                 let fields = Fields {
@@ -247,7 +254,7 @@ impl App {
                     .as_deref()
                     .and_then(|b| pr_for_branch(by_branch, b))
                 {
-                    Some(pr) => PrCell::Open(pr),
+                    Some(pr) => PrCell::Found(pr),
                     None => PrCell::None,
                 }
             }

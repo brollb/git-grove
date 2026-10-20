@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use crate::app::pr_for_branch;
-use crate::gh::{self, Ci, Pr};
+use crate::gh::{self, Details, Pr};
 use crate::git::{self, Status};
 
 pub enum Msg {
@@ -22,9 +22,9 @@ pub enum Msg {
     Age(PathBuf, Option<u64>),
     /// PRs for the repo at this index, or the reason they are unavailable.
     Prs(usize, Result<HashMap<String, Pr>, String>),
-    /// CI and review state for that repo's PRs, by number. Always follows its
-    /// repo's `Prs`, even when there was nothing to ask about.
-    Ci(usize, Result<HashMap<u64, Ci>, String>),
+    /// CI for that repo's open PRs, and merged PRs for its other branches.
+    /// Always follows its repo's `Prs`, even when there was nothing to ask.
+    Details(usize, Result<Details, String>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -159,25 +159,32 @@ impl Loader {
         self.requested.remove(&(false, path.to_path_buf()));
     }
 
-    /// Look up the repo's open PRs, then CI for the ones on these branches.
+    /// Look up the repo's open PRs, then CI for the ones on these branches and
+    /// merged PRs for the branches with none open.
     pub fn spawn_prs(&self, repo: usize, dir: PathBuf, branches: Vec<String>) {
         let tx = self.tx.clone();
         thread::spawn(move || {
             let prs = gh::fetch(&dir);
-            let ci = match &prs {
+            let details = match &prs {
                 Ok(by_branch) => {
-                    let mut wanted: Vec<&Pr> = branches
-                        .iter()
-                        .filter_map(|b| pr_for_branch(by_branch, b))
-                        .collect();
-                    wanted.sort_by_key(|pr| pr.number);
-                    wanted.dedup_by_key(|pr| pr.number);
-                    gh::fetch_ci(&dir, &wanted)
+                    let mut open: Vec<&Pr> = Vec::new();
+                    let mut unmatched: Vec<String> = Vec::new();
+                    for branch in &branches {
+                        match pr_for_branch(by_branch, branch) {
+                            Some(pr) => open.push(pr),
+                            None => unmatched.extend(git::pr_candidates(branch)),
+                        }
+                    }
+                    open.sort_by_key(|pr| pr.number);
+                    open.dedup_by_key(|pr| pr.number);
+                    unmatched.sort();
+                    unmatched.dedup();
+                    gh::fetch_details(&dir, &open, &unmatched)
                 }
                 Err(why) => Err(why.clone()),
             };
             if tx.send(Msg::Prs(repo, prs)).is_ok() {
-                let _ = tx.send(Msg::Ci(repo, ci));
+                let _ = tx.send(Msg::Details(repo, details));
             }
         });
     }
