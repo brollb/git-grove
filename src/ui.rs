@@ -1079,8 +1079,8 @@ fn detail_text(app: &App, i: usize, now: u64) -> String {
     if let Some(base) = app.statuses.get(&wt.path).and_then(|s| s.base.as_ref()) {
         parts.push(base_phrase(base));
     }
-    parts.push(match app.pr_for(wt) {
-        PrCell::Found(pr) => format!(
+    parts.extend(match app.pr_for(wt) {
+        PrCell::Found(pr) => Some(format!(
             "#{}{} {}",
             pr.number,
             if pr.merged {
@@ -1091,11 +1091,11 @@ fn detail_text(app: &App, i: usize, now: u64) -> String {
                 ""
             },
             pr.title
-        ),
-        PrCell::Loading => "looking up pull requests\u{2026}".to_string(),
-        PrCell::Unavailable(why) => format!("no PR data: {why}"),
-        PrCell::None if app.want_prs => "no open PR for this branch".to_string(),
-        PrCell::None => crate::git::short_sha(&wt.head),
+        )),
+        PrCell::Loading => Some("looking up pull requests\u{2026}".to_string()),
+        PrCell::Unavailable(why) => Some(format!("no PR data: {why}")),
+        PrCell::None if app.want_prs => Some("no PR for this branch".to_string()),
+        PrCell::None => None,
     });
     if let PrCell::Found(pr) = app.pr_for(wt) {
         // Commits made after the merge, or a merge of commits made elsewhere:

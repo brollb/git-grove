@@ -27,7 +27,8 @@ impl Worktree {
         match &self.branch {
             Some(b) => b.clone(),
             None if self.bare => "(bare)".to_string(),
-            None => format!("(detached {})", short_sha(&self.head)),
+            // The COMMIT column already names the commit.
+            None => "(detached)".to_string(),
         }
     }
 }
@@ -529,7 +530,7 @@ prunable gitdir file points to non-existent location
         assert!(wts[2].detached);
         assert!(wts[2].prunable);
         assert_eq!(wts[2].branch, None);
-        assert_eq!(wts[2].branch_label(), "(detached cccccccc)");
+        assert_eq!(wts[2].branch_label(), "(detached)");
     }
 
     #[test]
