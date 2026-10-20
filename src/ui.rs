@@ -12,8 +12,8 @@ use crossterm::{execute, terminal};
 
 use crate::app::{App, PrCell, Sort};
 use crate::fuzzy::Hits;
-use crate::gh;
-use crate::git::{self, Status};
+use crate::gh::{self, Checks, Verdict};
+use crate::git::{self, Divergence, Status};
 use crate::load::{Loader, Msg};
 
 const RESET: &str = "\x1b[0m";
@@ -737,17 +737,19 @@ struct Widths {
     pr: usize,
     branch: usize,
     commit: usize,
+    base: usize,
     status: usize,
     age: usize,
     path: usize,
 }
 
 fn widths(app: &App, total: usize) -> Widths {
-    let pr = 7;
+    let pr = 9;
     let commit = 8;
+    let base = 9;
     let status = 14;
     let age = 5;
-    let fixed = 3 + pr + 2 + commit + 2 + status + 2 + age + 2 + 2; // gutter + gaps
+    let fixed = 3 + pr + 2 + commit + 2 + base + 2 + status + 2 + age + 2 + 2; // gutter + gaps
     let flex = total.saturating_sub(fixed).max(20);
     let longest = app
         .worktrees
@@ -760,6 +762,7 @@ fn widths(app: &App, total: usize) -> Widths {
         pr,
         branch,
         commit,
+        base,
         status,
         age,
         path: flex.saturating_sub(branch).max(8),
@@ -827,10 +830,11 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
             DIM,
             &fit(
                 &format!(
-                    "   {}  {}  {}  {}  {}  {}",
+                    "   {}  {}  {}  {}  {}  {}  {}",
                     fit("PR", w.pr),
                     fit("BRANCH", w.branch),
                     fit("COMMIT", w.commit),
+                    fit("VS MAIN", w.base),
                     fit("STATUS", w.status),
                     fit_right("AGE", w.age),
                     "PATH"
@@ -863,6 +867,7 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
                 };
                 let age_cell = fit_right(&age_text(status, now), w.age);
                 let commit_cell = fit(&commit_text(wt), w.commit);
+                let base_cell = fit(&base_text(status), w.base);
                 let branch = wt.branch_label();
                 let path = crate::app::display_path(&wt.path, Some(&app.root));
                 let marked = f.marked.contains(&wt.path);
@@ -877,7 +882,7 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
                     // their resets) can't punch holes in the highlight.
                     let plain = fit(
                         &format!(
-                            "{marker}{pr_cell}  {}  {commit_cell}  {status_cell}  {age_cell}  {}",
+                            "{marker}{pr_cell}  {}  {commit_cell}  {base_cell}  {status_cell}  {age_cell}  {}",
                             fit(&branch, w.branch),
                             fit_tail(&path, w.path)
                         ),
@@ -891,10 +896,11 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
                         marker.clone()
                     };
                     let styled = format!(
-                        "{marker}{}  {}  {}  {}  {}  {}",
-                        paint(pr_color(app.pr_for(wt)), &pr_cell, true),
+                        "{marker}{}  {}  {}  {}  {}  {}  {}",
+                        pr_styled(app.pr_for(wt), w.pr),
                         fit_hl(&branch, w.branch, &hits.branch, false, ""),
                         paint(DIM, &commit_cell, true),
+                        paint(DIM, &base_cell, true),
                         paint(status_color(status, wt.prunable), &status_cell, true),
                         paint(DIM, &age_cell, true),
                         fit_hl(&path, w.path, &hits.path, true, DIM),
@@ -903,7 +909,7 @@ fn draw(tty: &mut File, app: &App, f: &Frame) -> io::Result<()> {
                 } else {
                     let plain = fit(
                         &format!(
-                            "{marker}{pr_cell}  {}  {commit_cell}  {status_cell}  {age_cell}  {}",
+                            "{marker}{pr_cell}  {}  {commit_cell}  {base_cell}  {status_cell}  {age_cell}  {}",
                             fit(&branch, w.branch),
                             fit_tail(&path, w.path)
                         ),
@@ -1061,6 +1067,9 @@ fn detail_text(app: &App, i: usize, now: u64) -> String {
     if let Some(touched) = app.statuses.get(&wt.path).and_then(|s| s.touched) {
         parts.push(format!("modified {}", age_phrase(now, touched)));
     }
+    if let Some(base) = app.statuses.get(&wt.path).and_then(|s| s.base.as_ref()) {
+        parts.push(base_phrase(base));
+    }
     parts.push(match app.pr_for(wt) {
         PrCell::Open(pr) => format!(
             "#{}{} {}",
@@ -1073,6 +1082,16 @@ fn detail_text(app: &App, i: usize, now: u64) -> String {
         PrCell::None if app.want_prs => "no open PR for this branch".to_string(),
         PrCell::None => crate::git::short_sha(&wt.head),
     });
+    if let PrCell::Open(pr) = app.pr_for(wt) {
+        match (pr.ci, app.ci_errors.get(&wt.repo)) {
+            (Some(ci), _) => {
+                parts.extend(checks_phrase(&ci.checks));
+                parts.extend(ci.review.label().map(str::to_string));
+            }
+            (None, Some(why)) => parts.push(format!("no CI data: {why}")),
+            (None, None) => {}
+        }
+    }
     format!("  {}", parts.join("  \u{b7}  "))
 }
 
@@ -1157,9 +1176,96 @@ fn age_phrase(now: u64, then: u64) -> String {
 
 fn pr_text(cell: PrCell) -> String {
     match cell {
-        PrCell::Open(pr) => format!("#{}", pr.number),
+        PrCell::Open(pr) => match pr.ci.and_then(|ci| checks_glyph(&ci.checks)) {
+            Some((glyph, _)) => format!("#{} {glyph}", pr.number),
+            None => format!("#{}", pr.number),
+        },
         PrCell::Loading => "\u{2026}".to_string(),
         _ => "-".to_string(),
+    }
+}
+
+/// The PR cell in color: the number in the PR's color, the CI glyph in its own.
+fn pr_styled(cell: PrCell, w: usize) -> String {
+    let text = fit(&pr_text(cell), w);
+    let PrCell::Open(pr) = cell else {
+        return paint(pr_color(cell), &text, true);
+    };
+    let number = format!("#{}", pr.number);
+    match pr.ci.and_then(|ci| checks_glyph(&ci.checks)) {
+        // Only split the cell when it fits whole; a truncated one stays plain.
+        Some((glyph, color)) if text.trim_end() == format!("{number} {glyph}") => {
+            let pad = &text[text.trim_end().len()..];
+            format!(
+                "{} {}{pad}",
+                paint(pr_color(cell), &number, true),
+                paint(color, glyph, true)
+            )
+        }
+        _ => paint(pr_color(cell), &text, true),
+    }
+}
+
+/// CI at a glance: `✓` passing, `✗` failing, `●` still running.
+fn checks_glyph(checks: &Checks) -> Option<(&'static str, &'static str)> {
+    match checks.verdict() {
+        Verdict::Passing => Some(("\u{2713}", GREEN)),
+        Verdict::Failing => Some(("\u{2717}", RED)),
+        Verdict::Pending => Some(("\u{25cf}", YELLOW)),
+        Verdict::None => None,
+    }
+}
+
+/// CI spelled out for the detail line.
+fn checks_phrase(checks: &Checks) -> Option<String> {
+    let total = checks.total();
+    match checks.verdict() {
+        Verdict::Passing => Some("checks passing".to_string()),
+        Verdict::Failing => Some(format!("{} of {total} checks failing", checks.failed)),
+        Verdict::Pending => Some(format!("{} of {total} checks running", checks.pending)),
+        Verdict::None => None,
+    }
+}
+
+/// Drift from the main branch for the column: `+3 −140`, `even`, or `-` when
+/// there is no main branch to compare against.
+fn base_text(status: Option<&Status>) -> String {
+    let Some(s) = status else {
+        return "\u{2026}".to_string();
+    };
+    let Some(base) = &s.base else {
+        return "-".to_string();
+    };
+    let mut parts = Vec::new();
+    if base.ahead > 0 {
+        parts.push(format!("+{}", count(base.ahead)));
+    }
+    if base.behind > 0 {
+        parts.push(format!("\u{2212}{}", count(base.behind)));
+    }
+    if parts.is_empty() {
+        "even".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// A commit count short enough for the column: thousands become `1k`.
+fn count(n: usize) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        format!("{}k", n / 1000)
+    }
+}
+
+/// Drift from the main branch for the detail line.
+fn base_phrase(base: &Divergence) -> String {
+    match (base.ahead, base.behind) {
+        (0, 0) => format!("even with {}", base.name),
+        (ahead, 0) => format!("{ahead} ahead of {}", base.name),
+        (0, behind) => format!("{behind} behind {}", base.name),
+        (ahead, behind) => format!("{ahead} ahead of, {behind} behind {}", base.name),
     }
 }
 
@@ -1688,5 +1794,81 @@ mod tests {
             summary.contains("1 refused: contains modified files"),
             "{summary:?}"
         );
+    }
+
+    fn diverged(ahead: usize, behind: usize) -> Status {
+        Status {
+            base: Some(Divergence {
+                name: "origin/main".to_string(),
+                ahead,
+                behind,
+            }),
+            ..Status::default()
+        }
+    }
+
+    #[test]
+    fn drift_from_main_fits_its_column() {
+        assert_eq!(base_text(None), "\u{2026}", "still loading");
+        assert_eq!(base_text(Some(&Status::default())), "-", "no main branch");
+        assert_eq!(base_text(Some(&diverged(0, 0))), "even");
+        assert_eq!(base_text(Some(&diverged(3, 0))), "+3");
+        assert_eq!(base_text(Some(&diverged(0, 140))), "\u{2212}140");
+        // Thousands are abbreviated, so even a long-abandoned branch fits.
+        let stale = base_text(Some(&diverged(120, 45_678)));
+        assert_eq!(stale, "+120 \u{2212}45k");
+        assert!(stale.chars().count() <= 9);
+    }
+
+    #[test]
+    fn drift_from_main_is_spelled_out_against_the_ref() {
+        let phrase = |ahead, behind| base_phrase(diverged(ahead, behind).base.as_ref().unwrap());
+        assert_eq!(phrase(0, 0), "even with origin/main");
+        assert_eq!(phrase(2, 0), "2 ahead of origin/main");
+        assert_eq!(phrase(0, 9), "9 behind origin/main");
+        assert_eq!(phrase(2, 9), "2 ahead of, 9 behind origin/main");
+    }
+
+    fn pr(checks: Checks) -> gh::Pr {
+        gh::Pr {
+            number: 42,
+            draft: false,
+            title: String::new(),
+            url: String::new(),
+            ci: Some(gh::Ci {
+                checks,
+                review: gh::Review::None,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_pr_cell_carries_the_ci_verdict() {
+        let failing = pr(Checks {
+            passed: 5,
+            failed: 1,
+            pending: 2,
+        });
+        assert_eq!(pr_text(PrCell::Open(&failing)), "#42 \u{2717}");
+        assert_eq!(
+            checks_phrase(&failing.ci.unwrap().checks).as_deref(),
+            Some("1 of 8 checks failing")
+        );
+        let unchecked = pr(Checks::default());
+        assert_eq!(pr_text(PrCell::Open(&unchecked)), "#42");
+        assert_eq!(checks_phrase(&unchecked.ci.unwrap().checks), None);
+    }
+
+    #[test]
+    fn the_colored_pr_cell_is_as_wide_as_the_plain_one() {
+        let passing = pr(Checks {
+            passed: 3,
+            failed: 0,
+            pending: 0,
+        });
+        let cell = PrCell::Open(&passing);
+        assert_eq!(visible(&pr_styled(cell, 9)), fit(&pr_text(cell), 9));
+        // Too narrow to split: truncated, and still the right width.
+        assert_eq!(visible(&pr_styled(cell, 3)).chars().count(), 3);
     }
 }

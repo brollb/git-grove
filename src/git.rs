@@ -33,7 +33,7 @@ impl Worktree {
 }
 
 /// Working-tree and upstream divergence for one worktree.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Status {
     pub modified: usize,
     pub untracked: usize,
@@ -46,6 +46,56 @@ pub struct Status {
     /// the files git reports as changed. A clean worktree therefore reports its
     /// last commit; a dirty one reports the actual last edit.
     pub touched: Option<u64>,
+    /// How far HEAD has drifted from the repo's main branch; `None` when there
+    /// is no main branch to compare against.
+    pub base: Option<Divergence>,
+}
+
+/// Commits on HEAD and not on the main branch (`ahead`), and the reverse.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Divergence {
+    /// The ref compared against, such as `origin/main`.
+    pub name: String,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+/// Where to look for the repo's main branch, best first. The remote's copy
+/// wins over a local one: in a repo worked through worktrees, local `main` is
+/// rarely checked out, so it is rarely pulled and rarely current.
+const BASE_CANDIDATES: &[&str] = &[
+    "origin/HEAD",
+    "origin/main",
+    "origin/master",
+    "main",
+    "master",
+];
+
+/// The repo's main branch, as a ref name (`origin/HEAD` resolves to the branch
+/// it points at, such as `origin/main`).
+fn base_ref(path: &Path) -> Option<String> {
+    BASE_CANDIDATES.iter().find_map(|candidate| {
+        git(
+            path,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--abbrev-ref",
+                candidate,
+            ],
+        )
+        .map(|out| out.trim().to_string())
+        .filter(|name| !name.is_empty())
+    })
+}
+
+/// `git rev-list --left-right --count` output: `<left> <right>`.
+fn left_right(out: &str) -> (usize, usize) {
+    let mut counts = out.split_whitespace();
+    let left = counts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    let right = counts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    (left, right)
 }
 
 impl Status {
@@ -395,10 +445,26 @@ pub fn status(path: &Path) -> Status {
         path,
         &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
     ) {
-        let mut counts = out.split_whitespace();
-        s.behind = counts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
-        s.ahead = counts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        (s.behind, s.ahead) = left_right(&out);
     }
+    // Fails (harmlessly) on a repo with no commits yet.
+    s.base = base_ref(path).and_then(|name| {
+        let out = git(
+            path,
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("{name}...HEAD"),
+            ],
+        )?;
+        let (behind, ahead) = left_right(&out);
+        Some(Divergence {
+            name,
+            ahead,
+            behind,
+        })
+    });
     s
 }
 

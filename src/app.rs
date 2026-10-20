@@ -68,6 +68,8 @@ pub struct App {
     pub ages: HashMap<PathBuf, Option<u64>>,
     pub sort: Sort,
     pub prs: HashMap<usize, Result<HashMap<String, Pr>, String>>,
+    /// Why CI could not be looked up, per repo. The PRs themselves still show.
+    pub ci_errors: HashMap<usize, String>,
     pub root: PathBuf,
     pub want_prs: bool,
     pub color: bool,
@@ -88,6 +90,7 @@ impl App {
             ages: HashMap::new(),
             sort: Sort::default(),
             prs: HashMap::new(),
+            ci_errors: HashMap::new(),
             root,
             want_prs,
             color,
@@ -104,6 +107,16 @@ impl App {
             }
             Msg::Prs(repo, result) => {
                 self.prs.insert(repo, result);
+            }
+            Msg::Ci(repo, Ok(found)) => {
+                if let Some(Ok(by_branch)) = self.prs.get_mut(&repo) {
+                    for pr in by_branch.values_mut() {
+                        pr.ci = found.get(&pr.number).copied();
+                    }
+                }
+            }
+            Msg::Ci(repo, Err(why)) => {
+                self.ci_errors.insert(repo, why);
             }
             // The picker handles these itself: it drops removed rows once a
             // whole batch has reported, and rescans the repo after an add.
@@ -229,18 +242,24 @@ impl App {
             None => PrCell::Loading,
             Some(Err(why)) => PrCell::Unavailable(why),
             Some(Ok(by_branch)) => {
-                let Some(branch) = &wt.branch else {
-                    return PrCell::None;
-                };
-                for candidate in git::pr_candidates(branch) {
-                    if let Some(pr) = by_branch.get(&candidate) {
-                        return PrCell::Open(pr);
-                    }
+                match wt
+                    .branch
+                    .as_deref()
+                    .and_then(|b| pr_for_branch(by_branch, b))
+                {
+                    Some(pr) => PrCell::Open(pr),
+                    None => PrCell::None,
                 }
-                PrCell::None
             }
         }
     }
+}
+
+/// The open PR for a local branch, allowing for how it may have been pushed.
+pub fn pr_for_branch<'a>(by_branch: &'a HashMap<String, Pr>, branch: &str) -> Option<&'a Pr> {
+    git::pr_candidates(branch)
+        .iter()
+        .find_map(|candidate| by_branch.get(candidate))
 }
 
 /// Path relative to `root` when it sits underneath it, else `~`-shortened.

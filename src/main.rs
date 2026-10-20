@@ -212,7 +212,14 @@ fn main() -> ExitCode {
     let (mut loader, rx) = Loader::new(8);
     if opts.prs {
         for (i, repo) in app.repos.iter().enumerate() {
-            loader.spawn_prs(i, repo.main_path.clone());
+            loader.spawn_prs(
+                i,
+                repo.main_path.clone(),
+                repo.worktrees
+                    .iter()
+                    .filter_map(|w| w.branch.clone())
+                    .collect(),
+            );
         }
     }
 
@@ -236,7 +243,8 @@ fn main() -> ExitCode {
     }
 
     // Non-interactive: everything has to be resolved before we can print.
-    let mut outstanding = if opts.prs { app.repos.len() } else { 0 };
+    // Each repo answers twice: its PRs, then their CI.
+    let mut outstanding = if opts.prs { 2 * app.repos.len() } else { 0 };
     if opts.status {
         for wt in &app.worktrees {
             if loader.request_status(&wt.path) {
@@ -346,8 +354,18 @@ fn print_plain(app: &App, selection: &[usize], with_status: bool) {
         if wt.prunable {
             flags.push("prunable".to_string());
         }
-        if matches!(app.pr_for(wt), PrCell::Open(pr) if pr.draft) {
-            flags.push("draft".to_string());
+        if let PrCell::Open(pr) = app.pr_for(wt) {
+            if pr.draft {
+                flags.push("draft".to_string());
+            }
+            if let Some(ci) = pr.ci {
+                if let Some(state) = checks_state(&ci.checks) {
+                    flags.push(format!("checks={state}"));
+                }
+                if let Some(review) = review_state(ci.review) {
+                    flags.push(format!("review={review}"));
+                }
+            }
         }
         if with_status {
             if let Some(s) = app.statuses.get(&wt.path) {
@@ -370,6 +388,11 @@ fn print_plain(app: &App, selection: &[usize], with_status: bool) {
                     if let Some(touched) = s.touched {
                         flags.push(format!("mtime={touched}"));
                     }
+                    if let Some(base) = &s.base {
+                        flags.push(format!("base={}", base.name));
+                        flags.push(format!("base_ahead={}", base.ahead));
+                        flags.push(format!("base_behind={}", base.behind));
+                    }
                 }
             }
         }
@@ -386,6 +409,27 @@ fn print_plain(app: &App, selection: &[usize], with_status: bool) {
                 flags.join(",")
             },
         );
+    }
+}
+
+/// The CI verdict as a machine-readable word; `None` when no checks ran.
+fn checks_state(checks: &gh::Checks) -> Option<&'static str> {
+    match checks.verdict() {
+        gh::Verdict::Passing => Some("pass"),
+        gh::Verdict::Failing => Some("fail"),
+        gh::Verdict::Pending => Some("pending"),
+        gh::Verdict::None => None,
+    }
+}
+
+/// The review decision as a machine-readable word; `None` when the repo does
+/// not require reviews.
+fn review_state(review: gh::Review) -> Option<&'static str> {
+    match review {
+        gh::Review::Approved => Some("approved"),
+        gh::Review::ChangesRequested => Some("changes_requested"),
+        gh::Review::Required => Some("required"),
+        gh::Review::None => None,
     }
 }
 
@@ -411,6 +455,13 @@ fn print_json(app: &App, selection: &[usize], with_status: bool) {
                         "draft": pr.draft,
                         "title": pr.title,
                         "url": pr.url,
+                        "checks": pr.ci.map(|ci| serde_json::json!({
+                            "state": checks_state(&ci.checks),
+                            "passed": ci.checks.passed,
+                            "failed": ci.checks.failed,
+                            "pending": ci.checks.pending,
+                        })),
+                        "review": pr.ci.and_then(|ci| review_state(ci.review)),
                     }),
                     _ => serde_json::Value::Null,
                 },
@@ -425,6 +476,11 @@ fn print_json(app: &App, selection: &[usize], with_status: bool) {
                         "ahead": s.ahead,
                         "behind": s.behind,
                         "last_modified": s.touched,
+                        "base": s.base.as_ref().map(|base| serde_json::json!({
+                            "ref": base.name,
+                            "ahead": base.ahead,
+                            "behind": base.behind,
+                        })),
                     });
                 }
             }

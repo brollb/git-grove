@@ -8,7 +8,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::gh::{self, Pr};
+use crate::app::pr_for_branch;
+use crate::gh::{self, Ci, Pr};
 use crate::git::{self, Status};
 
 pub enum Msg {
@@ -21,6 +22,9 @@ pub enum Msg {
     Age(PathBuf, Option<u64>),
     /// PRs for the repo at this index, or the reason they are unavailable.
     Prs(usize, Result<HashMap<String, Pr>, String>),
+    /// CI and review state for that repo's PRs, by number. Always follows its
+    /// repo's `Prs`, even when there was nothing to ask about.
+    Ci(usize, Result<HashMap<u64, Ci>, String>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -155,10 +159,26 @@ impl Loader {
         self.requested.remove(&(false, path.to_path_buf()));
     }
 
-    pub fn spawn_prs(&self, repo: usize, dir: PathBuf) {
+    /// Look up the repo's open PRs, then CI for the ones on these branches.
+    pub fn spawn_prs(&self, repo: usize, dir: PathBuf, branches: Vec<String>) {
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let _ = tx.send(Msg::Prs(repo, gh::fetch(&dir)));
+            let prs = gh::fetch(&dir);
+            let ci = match &prs {
+                Ok(by_branch) => {
+                    let mut wanted: Vec<&Pr> = branches
+                        .iter()
+                        .filter_map(|b| pr_for_branch(by_branch, b))
+                        .collect();
+                    wanted.sort_by_key(|pr| pr.number);
+                    wanted.dedup_by_key(|pr| pr.number);
+                    gh::fetch_ci(&dir, &wanted)
+                }
+                Err(why) => Err(why.clone()),
+            };
+            if tx.send(Msg::Prs(repo, prs)).is_ok() {
+                let _ = tx.send(Msg::Ci(repo, ci));
+            }
         });
     }
 }
